@@ -11,11 +11,13 @@ case class SystolicMatmulConfig(
     maxOutstandingRd: Int = 16,
     cmdqDepth: Int = 4,
     outFifoDepthCl: Int = 32,
+    stagedTileDepth: Int = 8,
     lMul: Int = 4,
     lAdd: Int = 4
 ) {
   require(clBits % fpBits == 0, "CL_BITS must be a multiple of FP_BITS")
   require((maxOutstandingRd & (maxOutstandingRd - 1)) == 0, "MAX_OUTSTANDING_RD must be power of 2")
+  require(stagedTileDepth > 1, "stagedTileDepth must be > 1")
 
   val clBytes: Int = clBits / 8
   val clElems: Int = clBits / fpBits
@@ -82,18 +84,29 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   val cmdFrontend = CmdFrontend(cfg)
   val tileScheduler = TileScheduler(cfg)
-  val readEngineA = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd)
-  val readEngineB = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd)
+  val readEngineA = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd, descriptorQueueDepth = cfg.stagedTileDepth)
+  val readEngineB = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd, descriptorQueueDepth = cfg.stagedTileDepth)
   val systolicCore = SystolicCore(cfg.s, cfg.lMul, cfg.lAdd)
   val drainPacker = DrainPacker(cfg)
 
-  // A ping-pong staging buffers (each bank stores one SxS tile as rows).
-  val aStageBank0 = Vec(Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s), cfg.s)
-  val aStageBank1 = Vec(Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s), cfg.s)
+  // Deep staged-tile buffers (depth-configurable, ordered producer/consumer).
+  val stageDepth = cfg.stagedTileDepth
+  val stagePtrW = log2Up(stageDepth)
+  val stageCountW = log2Up(stageDepth + 1)
 
-  // B ping-pong staging buffers (one S-CL tile per bank).
-  val bStageBank0 = Vec(Reg(Bits(cfg.clBits bits)) init (B(0, cfg.clBits bits)), cfg.s)
-  val bStageBank1 = Vec(Reg(Bits(cfg.clBits bits)) init (B(0, cfg.clBits bits)), cfg.s)
+  val aStageTiles = Vec(
+    Vec(
+      Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s),
+      cfg.s
+    ),
+    stageDepth
+  )
+  val bStageTiles = Vec(
+    Vec(Reg(Bits(cfg.clBits bits)) init (B(0, cfg.clBits bits)), cfg.s),
+    stageDepth
+  )
+  val stagedAValid = Vec(Reg(Bool()) init (False), stageDepth)
+  val stagedBValid = Vec(Reg(Bool()) init (False), stageDepth)
 
   // Output FIFO between DrainPacker and d_wr_* ports
   val outFifo = StreamFifo(DWriteEntry(cfg), cfg.outFifoDepthCl)
@@ -188,7 +201,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val cmdDispatchQ = StreamFifo(DispatchCmdCtx(cfg), cfg.cmdqDepth)
   val stepIssueQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
   val injectQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
-  val injectBankQ = StreamFifo(Bool(), ctrlFifoDepth)
+  val injectSlotQ = StreamFifo(UInt(stagePtrW bits), ctrlFifoDepth)
+  val injectSeqQ = StreamFifo(UInt(32 bits), ctrlFifoDepth)
   val drainQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
   val drainDelayW = log2Up(2 * (cfg.s - 1) + cfg.lMul + cfg.lAdd + 2)
   val drainDelayQ = StreamFifo(UInt(drainDelayW bits), ctrlFifoDepth)
@@ -214,11 +228,20 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val drainPendingValid = Reg(Bool()) init (False)
   val drainPendingCtx = Reg(StepCtx(cfg))
   val drainPendingDelay = Reg(UInt(drainDelayW bits)) init (0)
-  val prefetchStageBank = Reg(Bool()) init (False)
-  val injectStageBank = Reg(Bool()) init (False)
-  val nextPrefetchBank = Reg(Bool()) init (False)
-  val stageBankValid0 = Reg(Bool()) init (False)
-  val stageBankValid1 = Reg(Bool()) init (False)
+  val prefetchStageSlotA = Reg(UInt(stagePtrW bits)) init (0)
+  val prefetchStageSlotB = Reg(UInt(stagePtrW bits)) init (0)
+  val injectStageSlotA = Reg(UInt(stagePtrW bits)) init (0)
+  val injectStageSlotB = Reg(UInt(stagePtrW bits)) init (0)
+
+  val stagedAProdPtr = Reg(UInt(stagePtrW bits)) init (0)
+  val stagedBProdPtr = Reg(UInt(stagePtrW bits)) init (0)
+  val stagedAConsPtr = Reg(UInt(stagePtrW bits)) init (0)
+  val stagedBConsPtr = Reg(UInt(stagePtrW bits)) init (0)
+
+  val stagedACount = Reg(UInt(stageCountW bits)) init (0)
+  val stagedBCount = Reg(UInt(stageCountW bits)) init (0)
+  val stagedIssueSeq = Reg(UInt(32 bits)) init (0)
+  val stagedConsumeSeq = Reg(UInt(32 bits)) init (0)
 
   val schedCmdActive = Reg(Bool()) init (False)
   val schedAbort = Reg(Bool()) init (False)
@@ -231,6 +254,11 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val feedCnt = Reg(UInt(log2Up(cfg.s) bits)) init (0)
   val tailTotal = 2 * (cfg.s - 1) + cfg.lMul + cfg.lAdd
   val drainTailDelay = U(tailTotal + 1, drainDelayW bits)
+
+  def stagePtrInc(ptr: UInt): UInt = {
+    if (stageDepth == 1) U(0, stagePtrW bits)
+    else Mux(ptr === U(stageDepth - 1, stagePtrW bits), U(0, stagePtrW bits), ptr + 1)
+  }
 
   // Explicit hazard scoreboard for compute/drain bank conflicts.
   val bank0ComputeBusy = Reg(Bool()) init (False)
@@ -352,9 +380,13 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   injectQ.io.push.payload := prefetchCtx
   injectQ.io.pop.ready := False
 
-  injectBankQ.io.push.valid := False
-  injectBankQ.io.push.payload := prefetchStageBank
-  injectBankQ.io.pop.ready := False
+  injectSlotQ.io.push.valid := False
+  injectSlotQ.io.push.payload := prefetchStageSlotA
+  injectSlotQ.io.pop.ready := False
+
+  injectSeqQ.io.push.valid := False
+  injectSeqQ.io.push.payload := stagedIssueSeq
+  injectSeqQ.io.pop.ready := False
 
   drainQ.io.push.valid := False
   drainQ.io.push.payload := injectCtx
@@ -381,18 +413,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   readEngineB.io.cfgStride := 0
   readEngineB.io.cfgCount := 0
 
-  // ReadEngine A -> A ping-pong staging
+  // ReadEngine A -> staged A tiles
   readEngineA.io.outReady := False
 
-  // ReadEngine B -> B ping-pong staging
+  // ReadEngine B -> staged B tiles
   readEngineB.io.outReady := False
 
   // SystolicCore defaults
   val aFeedCol = Vec(Bits(32 bits), cfg.s)
   for (i <- 0 until cfg.s) {
-    aFeedCol(i) := Mux(injectStageBank, aStageBank1(i)(feedCnt), aStageBank0(i)(feedCnt))
+    aFeedCol(i) := aStageTiles(injectStageSlotA)(i)(feedCnt)
   }
-  val bFeedLine = Mux(injectStageBank, bStageBank1(feedCnt), bStageBank0(feedCnt))
+  val bFeedLine = bStageTiles(injectStageSlotB)(feedCnt)
   for (i <- 0 until cfg.s) {
     systolicCore.io.aIn(i) := aFeedCol(i)
     systolicCore.io.aValid(i) := False
@@ -435,6 +467,10 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   traceFeedStart := False
   traceDrainStart := False
   traceDrainDone := False
+  val stagedProduceFire = Bool()
+  val stagedConsumeFire = Bool()
+  stagedProduceFire := False
+  stagedConsumeFire := False
 
   val poisonReqValid = Bool()
   val poisonReqCmdId = UInt(16 bits)
@@ -529,20 +565,20 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   // ---------- Prefetch/issue engine ----------
 
-  val stageBank0Free = !stageBankValid0
-  val stageBank1Free = !stageBankValid1
-  val prefetchTargetBank = Bool()
-  prefetchTargetBank := Mux(stageBank0Free && stageBank1Free, nextPrefetchBank, Mux(stageBank1Free, True, False))
-  val prefetchBankFree = Bool()
-  prefetchBankFree := stageBank0Free || stageBank1Free
+  val stagedAFull = stagedACount === U(stageDepth, stageCountW bits)
+  val stagedBFull = stagedBCount === U(stageDepth, stageCountW bits)
+  val stagedCanAllocate = !stagedAFull && !stagedBFull
 
   switch(prefetchState) {
     is(PrefetchState.IDLE) {
       when(schedAbort) {
         stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
-      } elsewhen(stepIssueQ.io.pop.valid && prefetchBankFree) {
+      } elsewhen(stepIssueQ.io.pop.valid && stagedCanAllocate) {
+        assert(stagedAProdPtr === stagedBProdPtr, "A/B staged producer pointer mismatch")
         stepIssueQ.io.pop.ready := True
         prefetchCtx := stepIssueQ.io.pop.payload
+        prefetchStageSlotA := stagedAProdPtr
+        prefetchStageSlotB := stagedBProdPtr
         prefetchState := PrefetchState.START_READS
       }
     }
@@ -557,7 +593,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       readEngineB.io.cfgCount := U(cfg.s, 16 bits)
 
       when(!readEngineA.io.busy && !readEngineB.io.busy) {
-        prefetchStageBank := prefetchTargetBank
         readEngineA.io.start := True
         readEngineB.io.start := True
         aLoadCnt := 0
@@ -570,22 +605,14 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       when(readEngineA.io.outValid && (aLoadCnt < U(cfg.s, aLoadCnt.getWidth bits))) {
         readEngineA.io.outReady := True
         for (e <- 0 until cfg.s) {
-          when(prefetchStageBank) {
-            aStageBank1(aLoadCnt.resized)(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
-          } otherwise {
-            aStageBank0(aLoadCnt.resized)(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
-          }
+          aStageTiles(prefetchStageSlotA)(aLoadCnt.resized)(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
         }
         aLoadCnt := aLoadCnt + 1
       }
 
       when(readEngineB.io.outValid && (bLoadCnt < U(cfg.s, bLoadCnt.getWidth bits))) {
         readEngineB.io.outReady := True
-        when(prefetchStageBank) {
-          bStageBank1(bLoadCnt.resized) := readEngineB.io.outData
-        } otherwise {
-          bStageBank0(bLoadCnt.resized) := readEngineB.io.outData
-        }
+        bStageTiles(prefetchStageSlotB)(bLoadCnt.resized) := readEngineB.io.outData
         bLoadCnt := bLoadCnt + 1
       }
 
@@ -597,24 +624,29 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
       val aDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
       val bDone = bLoadCnt === U(cfg.s, bLoadCnt.getWidth bits)
-      when(aDone && bDone && !errorDetected) {
+      val prefetchReadErr = errorDetected || readEngineA.io.error || readEngineB.io.error
+      when(aDone && bDone && !prefetchReadErr) {
         prefetchState := PrefetchState.ENQ_INJECT
       }
     }
 
     is(PrefetchState.ENQ_INJECT) {
-      val canEnqueueInject = injectQ.io.push.ready && injectBankQ.io.push.ready
+      val canEnqueueInject = injectQ.io.push.ready && injectSlotQ.io.push.ready && injectSeqQ.io.push.ready
       injectQ.io.push.valid := canEnqueueInject
       injectQ.io.push.payload := prefetchCtx
-      injectBankQ.io.push.valid := canEnqueueInject
-      injectBankQ.io.push.payload := prefetchStageBank
+      injectSlotQ.io.push.valid := canEnqueueInject
+      injectSlotQ.io.push.payload := prefetchStageSlotA
+      injectSeqQ.io.push.valid := canEnqueueInject
+      injectSeqQ.io.push.payload := stagedIssueSeq
       when(canEnqueueInject) {
-        when(prefetchStageBank) {
-          stageBankValid1 := True
-        } otherwise {
-          stageBankValid0 := True
-        }
-        nextPrefetchBank := !prefetchStageBank
+        assert(stagedACount =/= U(stageDepth, stageCountW bits), "staged A FIFO overflow")
+        assert(stagedBCount =/= U(stageDepth, stageCountW bits), "staged B FIFO overflow")
+        assert(!stagedAValid(prefetchStageSlotA), "staged A slot overwrite")
+        assert(!stagedBValid(prefetchStageSlotB), "staged B slot overwrite")
+        assert(prefetchStageSlotA === prefetchStageSlotB, "A/B staged producer slot mismatch")
+        stagedAValid(prefetchStageSlotA) := True
+        stagedBValid(prefetchStageSlotB) := True
+        stagedProduceFire := True
         prefetchState := PrefetchState.IDLE
       }
     }
@@ -638,8 +670,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       bank1DrainBusy := False
       bank0RowBusy := 0
       bank1RowBusy := 0
-      stageBankValid0 := False
-      stageBankValid1 := False
+      stagedAProdPtr := 0
+      stagedBProdPtr := 0
+      stagedAConsPtr := 0
+      stagedBConsPtr := 0
+      stagedACount := 0
+      stagedBCount := 0
+      stagedIssueSeq := 0
+      stagedConsumeSeq := 0
+      for (slot <- 0 until stageDepth) {
+        stagedAValid(slot) := False
+        stagedBValid(slot) := False
+      }
       drainPendingValid := False
       flushCmdLastPending := False
       injectState := InjectState.IDLE
@@ -650,7 +692,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   // ---------- Inject engine + hazard scoreboard ----------
 
-  val enableDrainOverlap = cfg.s <= 8
+  val enableDrainOverlap = false
   val bankHazardForInject = Bool()
   bankHazardForInject := False
   if (enableDrainOverlap) {
@@ -675,26 +717,35 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   val injectStageReady = Bool()
   injectStageReady := False
-  when(injectBankQ.io.pop.valid) {
-    injectStageReady := Mux(injectBankQ.io.pop.payload, stageBankValid1, stageBankValid0)
+  when(injectSlotQ.io.pop.valid) {
+    injectStageReady := stagedAValid(injectSlotQ.io.pop.payload) && stagedBValid(injectSlotQ.io.pop.payload)
   }
 
   switch(injectState) {
     is(InjectState.IDLE) {
       when(schedAbort) {
-        val canDropInject = injectQ.io.pop.valid && injectBankQ.io.pop.valid
+        val canDropInject = injectQ.io.pop.valid && injectSlotQ.io.pop.valid && injectSeqQ.io.pop.valid
         injectQ.io.pop.ready := canDropInject
-        injectBankQ.io.pop.ready := canDropInject
+        injectSlotQ.io.pop.ready := canDropInject
+        injectSeqQ.io.pop.ready := canDropInject
       } elsewhen(
         injectQ.io.pop.valid &&
-          injectBankQ.io.pop.valid &&
+          injectSlotQ.io.pop.valid &&
+          injectSeqQ.io.pop.valid &&
           !bankHazardForInject &&
           injectStageReady
       ) {
+        assert(injectSeqQ.io.pop.payload === stagedConsumeSeq, "staged step order violation at inject")
+        assert(injectSlotQ.io.pop.payload === stagedAConsPtr, "staged A consume pointer order violation at inject")
+        assert(injectSlotQ.io.pop.payload === stagedBConsPtr, "staged B consume pointer order violation at inject")
+
         injectQ.io.pop.ready := True
-        injectBankQ.io.pop.ready := True
+        injectSlotQ.io.pop.ready := True
+        injectSeqQ.io.pop.ready := True
         injectCtx := injectQ.io.pop.payload
-        injectStageBank := injectBankQ.io.pop.payload
+        injectStageSlotA := injectSlotQ.io.pop.payload
+        injectStageSlotB := injectSlotQ.io.pop.payload
+        stagedConsumeSeq := stagedConsumeSeq + 1
         coreBankSel := injectQ.io.pop.payload.bankSel
         when(injectQ.io.pop.payload.bankSel) {
           bank1ComputeBusy := True
@@ -719,11 +770,16 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       }
 
       when(feedCnt === U(cfg.s - 1, feedCnt.getWidth bits)) {
-        when(injectStageBank) {
-          stageBankValid1 := False
-        } otherwise {
-          stageBankValid0 := False
-        }
+        assert(stagedACount =/= 0, "staged A FIFO underflow")
+        assert(stagedBCount =/= 0, "staged B FIFO underflow")
+        assert(stagedAValid(injectStageSlotA), "staged A consume without valid tile")
+        assert(stagedBValid(injectStageSlotB), "staged B consume without valid tile")
+        assert(injectStageSlotA === injectStageSlotB, "A/B staged consume slot mismatch")
+
+        stagedAValid(injectStageSlotA) := False
+        stagedBValid(injectStageSlotB) := False
+        stagedConsumeFire := True
+
         when(injectCtx.drainTrigger) {
           injectState := InjectState.ENQ_DRAIN
         } otherwise {
@@ -758,6 +814,23 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         injectState := InjectState.IDLE
       }
     }
+  }
+
+  when(stagedProduceFire) {
+    stagedAProdPtr := stagePtrInc(stagedAProdPtr)
+    stagedBProdPtr := stagePtrInc(stagedBProdPtr)
+    stagedIssueSeq := stagedIssueSeq + 1
+  }
+  when(stagedConsumeFire) {
+    stagedAConsPtr := stagePtrInc(stagedAConsPtr)
+    stagedBConsPtr := stagePtrInc(stagedBConsPtr)
+  }
+  when(stagedProduceFire && !stagedConsumeFire) {
+    stagedACount := stagedACount + 1
+    stagedBCount := stagedBCount + 1
+  } elsewhen(!stagedProduceFire && stagedConsumeFire) {
+    stagedACount := stagedACount - 1
+    stagedBCount := stagedBCount - 1
   }
 
   // ---------- Drain engine ----------
@@ -962,6 +1035,11 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     }
   }
 
+  // Keep staged A/B FIFOs tightly aligned; any mismatch indicates control corruption.
+  assert(stagedACount === stagedBCount, "A/B staged count mismatch")
+  assert(stagedAProdPtr === stagedBProdPtr, "A/B staged producer pointer mismatch")
+  assert(stagedAConsPtr === stagedBConsPtr, "A/B staged consumer pointer mismatch")
+
   // ---------- Utilization/Trace Counter Updates ----------
 
   val aLoadDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
@@ -1066,12 +1144,13 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       (drainState === DrainState.IDLE) &&
       !stepIssueQ.io.pop.valid &&
       !injectQ.io.pop.valid &&
-      !injectBankQ.io.pop.valid &&
+      !injectSlotQ.io.pop.valid &&
+      !injectSeqQ.io.pop.valid &&
       !drainQ.io.pop.valid &&
       !drainDelayQ.io.pop.valid &&
       !drainPendingValid &&
-      !stageBankValid0 &&
-      !stageBankValid1 &&
+      (stagedACount === 0) &&
+      (stagedBCount === 0) &&
       !readEngineA.io.busy &&
       !readEngineB.io.busy
 

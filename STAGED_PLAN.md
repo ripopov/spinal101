@@ -22,7 +22,7 @@
 - [x] **Stage 14** — Utilization closure and CI gating
 - [x] **Stage 15** — Utilization metric hardening and root-cause attribution
 - [x] **Stage 16** — Multi-step continuous A/B prefetch
-- [ ] **Stage 17** — Deep staged-tile buffering and injector decoupling
+- [x] **Stage 17** — Deep staged-tile buffering and injector decoupling
 - [ ] **Stage 18** — Drain decoupling and hazard narrowing
 - [ ] **Stage 19** — FEED run-length optimization
 - [ ] **Stage 20** — Near-100% PE utilization CI closure
