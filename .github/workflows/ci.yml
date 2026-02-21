@@ -147,7 +147,6 @@ jobs:
           chmod +x .github/scripts/openlane_prepnr.sh
           docker pull "${OPENLANE_IMAGE}"
           docker run --rm \
-            -u "$(id -u):$(id -g)" \
             -v "$PWD":"$PWD" \
             -w "$PWD" \
             -e PDK_ROOT="${{ steps.pdk_path.outputs.pdk_path }}" \
