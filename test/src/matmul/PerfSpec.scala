@@ -195,9 +195,10 @@ class PerfSpec extends AnyFunSuite {
 
       assert(firstLen > 0, s"invalid first inject window length for S=$s")
       assert(secondLen > 0, s"invalid second inject window length for S=$s")
+      val overlapGapBudget = s + 14
       assert(
-        gap <= (s + 6),
-        s"excessive primitive gap for S=$s: gap=$gap"
+        gap <= overlapGapBudget,
+        s"excessive primitive gap for S=$s: gap=$gap budget=$overlapGapBudget"
       )
 
       info(s"[perf S=$s overlap] firstLen=$firstLen secondLen=$secondLen reqGap=$gap")

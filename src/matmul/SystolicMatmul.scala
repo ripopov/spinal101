@@ -181,38 +181,38 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   statusGen.io.cmdDoneValid := dWriteLastFire
   statusGen.io.cmdDoneCmdId := io.d_wr_cmd_id
 
-  // ---------- FeedController State Machine ----------
+  // ---------- Controller decomposition ----------
 
-  object FeedState extends SpinalEnum {
-    val IDLE, ACCEPT_CMD, START_READS, LOAD_AB, SWAP_TB, FEED,
-        TAIL, DRAIN_START, DRAIN_WAIT, FLUSH_START, FLUSH_D, NEXT_STEP, CMD_DONE, ERROR_DRAIN, ERROR_STATUS = newElement()
+  val ctrlFifoDepth = (cfg.cmdqDepth * 4).max(4)
+  val cmdDispatchQ = StreamFifo(DispatchCmdCtx(cfg), cfg.cmdqDepth)
+  val stepIssueQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
+  val injectQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
+  val drainQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
+
+  object PrefetchState extends SpinalEnum {
+    val IDLE, START_READS, LOAD_AB, ENQ_INJECT, ERROR_DRAIN, ERROR_STATUS = newElement()
   }
-  val feedState = RegInit(FeedState.IDLE)
+  object InjectState extends SpinalEnum {
+    val IDLE, SWAP_TB, FEED, TAIL, ENQ_DRAIN = newElement()
+  }
+  object DrainState extends SpinalEnum {
+    val IDLE, DRAIN_START, DRAIN_WAIT, FLUSH_START, FLUSH_WAIT, STEP_DONE = newElement()
+  }
 
-  // Latched command descriptor
-  val curCmd = Reg(CmdDesc(cfg))
+  val prefetchState = RegInit(PrefetchState.IDLE)
+  val injectState = RegInit(InjectState.IDLE)
+  val drainState = RegInit(DrainState.IDLE)
 
-  // Latched step info from TileScheduler
-  val stepPi = Reg(UInt(16 bits)) init (0)
-  val stepPj = Reg(UInt(16 bits)) init (0)
-  val stepPkCmd = Reg(UInt(16 bits)) init (0)
-  val stepMi = Reg(UInt(16 bits)) init (0)
-  val stepNj = Reg(UInt(16 bits)) init (0)
-  val stepPk = Reg(UInt(16 bits)) init (0)
-  val stepClearBank = Reg(Bool()) init (False)
-  val stepDrainTrigger = Reg(Bool()) init (False)
-  val stepBankSel = Reg(Bool()) init (False)
+  val schedCmdCtx = Reg(DispatchCmdCtx(cfg))
+  val prefetchCtx = Reg(StepCtx(cfg))
+  val injectCtx = Reg(StepCtx(cfg))
+  val drainCtx = Reg(StepCtx(cfg))
 
-  // DrainPacker bank selection (must be after stepBankSel declaration)
-  drainPacker.io.drainBankIn := stepBankSel
-
-  // Derived from command
-  val numPi = Reg(UInt(16 bits)) init (0)
-  val numPj = Reg(UInt(16 bits)) init (0)
-  val numPkCmd = Reg(UInt(16 bits)) init (0)
-  val numMi = Reg(UInt(16 bits)) init (0)
-  val numNj = Reg(UInt(16 bits)) init (0)
-  val numPk = Reg(UInt(16 bits)) init (0)
+  val schedCmdActive = Reg(Bool()) init (False)
+  val schedStepWaitingDone = Reg(Bool()) init (False)
+  val schedAbort = Reg(Bool()) init (False)
+  val errorDetected = Reg(Bool()) init (False)
+  val errorCmdId = Reg(UInt(16 bits)) init (0)
 
   val aLoadCnt = Reg(UInt(log2Up(cfg.s + 1) bits)) init (0)
   val bLoadCnt = Reg(UInt(log2Up(cfg.s + 1) bits)) init (0)
@@ -221,15 +221,14 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val tailCnt = Reg(UInt(log2Up(tailTotal + 1) bits)) init (0)
   val tailTarget = U(tailTotal - 1, log2Up(tailTotal + 1) bits)
 
-  val cmdActive = Reg(Bool()) init (False)
-  val errorDetected = Reg(Bool()) init (False)
-  val errorCmdId = Reg(UInt(16 bits)) init (0)
-
-  // Whether we need a flush after the current drain
-  val needsFlush = Reg(Bool()) init (False)
-
-  // Track whether this is the last step of the scheduler
-  val lastPkForMiNj = Reg(Bool()) init (False)
+  // Explicit hazard scoreboard for compute/drain bank conflicts.
+  val bank0ComputeBusy = Reg(Bool()) init (False)
+  val bank1ComputeBusy = Reg(Bool()) init (False)
+  val bank0DrainBusy = Reg(Bool()) init (False)
+  val bank1DrainBusy = Reg(Bool()) init (False)
+  val bank0RowBusy = Reg(Bits(cfg.s bits)) init (0)
+  val bank1RowBusy = Reg(Bits(cfg.s bits)) init (0)
+  val coreBankSel = Reg(Bool()) init (False)
 
   // ---------- Utilization/Trace Instrumentation (simulation-visible) ----------
 
@@ -313,13 +312,31 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   // ---------- Default assignments ----------
 
+  // Queue defaults
+  cmdDispatchQ.io.push.payload.cmdDesc := cmdFrontend.io.outDesc
+  cmdDispatchQ.io.push.payload.numPi := cmdFrontend.io.outDesc.m / cmdFrontend.io.outDesc.primM
+  cmdDispatchQ.io.push.payload.numPj := cmdFrontend.io.outDesc.n / cmdFrontend.io.outDesc.primN
+  cmdDispatchQ.io.push.payload.numPkCmd := cmdFrontend.io.outDesc.k / cmdFrontend.io.outDesc.primK
+  cmdDispatchQ.io.push.payload.numMi := cmdFrontend.io.outDesc.primM / U(cfg.s, 16 bits)
+  cmdDispatchQ.io.push.payload.numNj := cmdFrontend.io.outDesc.primN / U(cfg.s, 16 bits)
+  cmdDispatchQ.io.push.payload.numPk := cmdFrontend.io.outDesc.primK / U(cfg.s, 16 bits)
+  cmdDispatchQ.io.pop.ready := False
+
+  stepIssueQ.io.push.valid := False
+  stepIssueQ.io.pop.ready := False
+
+  injectQ.io.push.valid := False
+  injectQ.io.push.payload := prefetchCtx
+  injectQ.io.pop.ready := False
+
+  drainQ.io.push.valid := False
+  drainQ.io.push.payload := injectCtx
+  drainQ.io.pop.ready := False
+
   // TileScheduler
   tileScheduler.io.cmdValid := False
-  tileScheduler.io.cmdDesc := curCmd
+  tileScheduler.io.cmdDesc := schedCmdCtx.cmdDesc
   tileScheduler.io.stepReady := False
-
-  // CmdFrontend output consumption
-  cmdFrontend.io.outReady := False
 
   // ReadEngine A config
   readEngineA.io.start := False
@@ -358,23 +375,37 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     systolicCore.io.bIn(i) := bFifo.io.pop.payload((i + 1) * 32 - 1 downto i * 32)
     systolicCore.io.bValid(i) := False
   }
-  systolicCore.io.bankSel := stepBankSel
+  systolicCore.io.bankSel := coreBankSel
   systolicCore.io.clearBank := False
 
   // DrainPacker defaults
   drainPacker.io.drainStart := False
   drainPacker.io.flushStart := False
-  drainPacker.io.pi := stepPi
-  drainPacker.io.pj := stepPj
-  drainPacker.io.pkCmd := stepPkCmd
-  drainPacker.io.mi := stepMi
-  drainPacker.io.nj := stepNj
-  drainPacker.io.numPkCmd := numPkCmd
-  drainPacker.io.numMi := numMi
-  drainPacker.io.numNj := numNj
-  drainPacker.io.numPi := numPi
-  drainPacker.io.numPj := numPj
-  drainPacker.io.cmdDesc := curCmd
+  drainPacker.io.drainBankIn := False
+  drainPacker.io.pi := 0
+  drainPacker.io.pj := 0
+  drainPacker.io.pkCmd := 0
+  drainPacker.io.mi := 0
+  drainPacker.io.nj := 0
+  drainPacker.io.numPkCmd := 0
+  drainPacker.io.numMi := 0
+  drainPacker.io.numNj := 0
+  drainPacker.io.numPi := 0
+  drainPacker.io.numPj := 0
+  drainPacker.io.cmdDesc.cmdId := 0
+  drainPacker.io.cmdDesc.aBase := 0
+  drainPacker.io.cmdDesc.bBase := 0
+  drainPacker.io.cmdDesc.dBase := 0
+  drainPacker.io.cmdDesc.m := 0
+  drainPacker.io.cmdDesc.n := 0
+  drainPacker.io.cmdDesc.k := 0
+  drainPacker.io.cmdDesc.lda := 0
+  drainPacker.io.cmdDesc.ldb := 0
+  drainPacker.io.cmdDesc.ldd := 0
+  drainPacker.io.cmdDesc.primM := 0
+  drainPacker.io.cmdDesc.primN := 0
+  drainPacker.io.cmdDesc.primK := 0
+  drainPacker.io.cmdDesc.flags := 0
 
   // StatusGen error defaults
   statusGen.io.errValid := False
@@ -390,79 +421,116 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   val sWide = U(cfg.s, cfg.addrBits bits)
 
-  def computeABase(): UInt = {
-    val globalM = (stepPi.resize(cfg.addrBits) * curCmd.primM.resize(cfg.addrBits) +
-      stepMi.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
-    val globalK = (stepPkCmd.resize(cfg.addrBits) * curCmd.primK.resize(cfg.addrBits) +
-      stepPk.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
-    val offset = (globalM * curCmd.lda.resize(cfg.addrBits) + globalK).resize(cfg.addrBits)
-    (curCmd.aBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
+  def computeABase(step: StepCtx): UInt = {
+    val globalM = (step.pi.resize(cfg.addrBits) * step.cmdDesc.primM.resize(cfg.addrBits) +
+      step.mi.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
+    val globalK = (step.pkCmd.resize(cfg.addrBits) * step.cmdDesc.primK.resize(cfg.addrBits) +
+      step.pk.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
+    val offset = (globalM * step.cmdDesc.lda.resize(cfg.addrBits) + globalK).resize(cfg.addrBits)
+    (step.cmdDesc.aBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
   }
 
-  def computeBBase(): UInt = {
-    val globalK = (stepPkCmd.resize(cfg.addrBits) * curCmd.primK.resize(cfg.addrBits) +
-      stepPk.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
-    val globalN = (stepPj.resize(cfg.addrBits) * curCmd.primN.resize(cfg.addrBits) +
-      stepNj.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
-    val offset = (globalK * curCmd.ldb.resize(cfg.addrBits) + globalN).resize(cfg.addrBits)
-    (curCmd.bBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
+  def computeBBase(step: StepCtx): UInt = {
+    val globalK = (step.pkCmd.resize(cfg.addrBits) * step.cmdDesc.primK.resize(cfg.addrBits) +
+      step.pk.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
+    val globalN = (step.pj.resize(cfg.addrBits) * step.cmdDesc.primN.resize(cfg.addrBits) +
+      step.nj.resize(cfg.addrBits) * sWide).resize(cfg.addrBits)
+    val offset = (globalK * step.cmdDesc.ldb.resize(cfg.addrBits) + globalN).resize(cfg.addrBits)
+    (step.cmdDesc.bBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
   }
 
-  // ---------- State Machine ----------
+  // ---------- Command dispatch engine ----------
 
-  switch(feedState) {
-    is(FeedState.IDLE) {
-      when(cmdFrontend.io.outValid && !cmdActive) {
-        cmdFrontend.io.outReady := True
-        traceCmdAccepted := True
-        curCmd := cmdFrontend.io.outDesc
-        numPi := cmdFrontend.io.outDesc.m / cmdFrontend.io.outDesc.primM
-        numPj := cmdFrontend.io.outDesc.n / cmdFrontend.io.outDesc.primN
-        numPkCmd := cmdFrontend.io.outDesc.k / cmdFrontend.io.outDesc.primK
-        numMi := cmdFrontend.io.outDesc.primM / U(cfg.s, 16 bits)
-        numNj := cmdFrontend.io.outDesc.primN / U(cfg.s, 16 bits)
-        numPk := cmdFrontend.io.outDesc.primK / U(cfg.s, 16 bits)
-        cmdActive := True
-        errorDetected := False
-        feedState := FeedState.ACCEPT_CMD
+  cmdDispatchQ.io.push.valid := cmdFrontend.io.outValid && !schedAbort
+  cmdFrontend.io.outReady := cmdDispatchQ.io.push.ready && !schedAbort
+  when(cmdDispatchQ.io.push.fire) {
+    traceCmdAccepted := True
+  }
+
+  val stepDoneInjectPulse = Bool()
+  val stepDoneDrainPulse = Bool()
+  val stepDoneErrorPulse = Bool()
+  stepDoneInjectPulse := False
+  stepDoneDrainPulse := False
+  stepDoneErrorPulse := False
+  val stepDonePulse = stepDoneInjectPulse || stepDoneDrainPulse || stepDoneErrorPulse
+
+  // ---------- Step generation engine ----------
+
+  val emittedStep = StepCtx(cfg)
+  emittedStep.cmdDesc := schedCmdCtx.cmdDesc
+  emittedStep.numPi := schedCmdCtx.numPi
+  emittedStep.numPj := schedCmdCtx.numPj
+  emittedStep.numPkCmd := schedCmdCtx.numPkCmd
+  emittedStep.numMi := schedCmdCtx.numMi
+  emittedStep.numNj := schedCmdCtx.numNj
+  emittedStep.numPk := schedCmdCtx.numPk
+  emittedStep.pi := tileScheduler.io.pi
+  emittedStep.pj := tileScheduler.io.pj
+  emittedStep.pkCmd := tileScheduler.io.pkCmd
+  emittedStep.mi := tileScheduler.io.mi
+  emittedStep.nj := tileScheduler.io.nj
+  emittedStep.pk := tileScheduler.io.pk
+  emittedStep.clearBank := tileScheduler.io.clearBank
+  emittedStep.drainTrigger := tileScheduler.io.drainTrigger
+  emittedStep.bankSel := tileScheduler.io.bankSel
+  stepIssueQ.io.push.payload := emittedStep
+
+  when(!schedCmdActive && !schedAbort) {
+    tileScheduler.io.cmdValid := cmdDispatchQ.io.pop.valid
+    tileScheduler.io.cmdDesc := cmdDispatchQ.io.pop.payload.cmdDesc
+    cmdDispatchQ.io.pop.ready := tileScheduler.io.cmdReady
+    when(cmdDispatchQ.io.pop.fire) {
+      schedCmdCtx := cmdDispatchQ.io.pop.payload
+      schedCmdActive := True
+      schedStepWaitingDone := False
+      errorDetected := False
+    }
+  } elsewhen (schedAbort) {
+    stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
+    when(tileScheduler.io.busy && tileScheduler.io.stepValid) {
+      tileScheduler.io.stepReady := True
+    } elsewhen (!tileScheduler.io.busy) {
+      schedAbort := False
+      schedCmdActive := False
+      schedStepWaitingDone := False
+    }
+  } otherwise {
+    when(!schedStepWaitingDone && tileScheduler.io.stepValid && stepIssueQ.io.push.ready) {
+      stepIssueQ.io.push.valid := True
+      schedStepWaitingDone := True
+    }
+
+    when(schedStepWaitingDone && stepDonePulse) {
+      tileScheduler.io.stepReady := True
+      schedStepWaitingDone := False
+    }
+
+    when(!tileScheduler.io.busy && !schedStepWaitingDone) {
+      schedCmdActive := False
+    }
+  }
+
+  // ---------- Prefetch/issue engine ----------
+
+  switch(prefetchState) {
+    is(PrefetchState.IDLE) {
+      when(schedAbort) {
+        stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
+      } elsewhen(stepIssueQ.io.pop.valid) {
+        stepIssueQ.io.pop.ready := True
+        prefetchCtx := stepIssueQ.io.pop.payload
+        prefetchState := PrefetchState.START_READS
       }
     }
 
-    is(FeedState.ACCEPT_CMD) {
-      tileScheduler.io.cmdValid := True
-      tileScheduler.io.cmdDesc := curCmd
-      when(tileScheduler.io.cmdReady) {
-        feedState := FeedState.NEXT_STEP
-      }
-    }
-
-    is(FeedState.NEXT_STEP) {
-      when(tileScheduler.io.stepValid) {
-        // Latch step info
-        stepPi := tileScheduler.io.pi
-        stepPj := tileScheduler.io.pj
-        stepPkCmd := tileScheduler.io.pkCmd
-        stepMi := tileScheduler.io.mi
-        stepNj := tileScheduler.io.nj
-        stepPk := tileScheduler.io.pk
-        stepClearBank := tileScheduler.io.clearBank
-        stepDrainTrigger := tileScheduler.io.drainTrigger
-        stepBankSel := tileScheduler.io.bankSel
-        feedState := FeedState.START_READS
-      } elsewhen(!tileScheduler.io.busy) {
-        // Scheduler finished all steps
-        feedState := FeedState.CMD_DONE
-      }
-    }
-
-    is(FeedState.START_READS) {
-      // Program both read engines. Only pulse start when both are idle.
-      readEngineA.io.cfgBase := computeABase()
-      readEngineA.io.cfgStride := (curCmd.lda.resize(cfg.addrBits) * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
+    is(PrefetchState.START_READS) {
+      readEngineA.io.cfgBase := computeABase(prefetchCtx)
+      readEngineA.io.cfgStride := (prefetchCtx.cmdDesc.lda.resize(cfg.addrBits) * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
       readEngineA.io.cfgCount := U(cfg.s, 16 bits)
 
-      readEngineB.io.cfgBase := computeBBase()
-      readEngineB.io.cfgStride := (curCmd.ldb.resize(cfg.addrBits) * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
+      readEngineB.io.cfgBase := computeBBase(prefetchCtx)
+      readEngineB.io.cfgStride := (prefetchCtx.cmdDesc.ldb.resize(cfg.addrBits) * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
       readEngineB.io.cfgCount := U(cfg.s, 16 bits)
 
       when(!readEngineA.io.busy && !readEngineB.io.busy) {
@@ -470,12 +538,11 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         readEngineB.io.start := True
         aLoadCnt := 0
         bLoadCnt := 0
-        feedState := FeedState.LOAD_AB
+        prefetchState := PrefetchState.LOAD_AB
       }
     }
 
-    is(FeedState.LOAD_AB) {
-      // A side: ReadEngine -> TransposeBuffer
+    is(PrefetchState.LOAD_AB) {
       when(readEngineA.io.outValid && (aLoadCnt < U(cfg.s, aLoadCnt.getWidth bits))) {
         readEngineA.io.outReady := True
         transposeBuffer.io.wrValid := True
@@ -483,138 +550,227 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         aLoadCnt := aLoadCnt + 1
       }
 
-      // B side: ReadEngine -> B FIFO (wired by default above)
       when(readEngineB.io.outValid && bFifo.io.push.ready) {
         bLoadCnt := bLoadCnt + 1
       }
 
-      // Check for read errors
       when(readEngineA.io.error || readEngineB.io.error) {
         errorDetected := True
-        errorCmdId := curCmd.cmdId
-        feedState := FeedState.ERROR_DRAIN
+        errorCmdId := prefetchCtx.cmdDesc.cmdId
+        prefetchState := PrefetchState.ERROR_DRAIN
       }
 
-      // Both loaded S CLs
       val aDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
       val bDone = bLoadCnt === U(cfg.s, bLoadCnt.getWidth bits)
       when(aDone && bDone && !errorDetected) {
-        feedState := FeedState.SWAP_TB
+        prefetchState := PrefetchState.ENQ_INJECT
       }
     }
 
-    is(FeedState.SWAP_TB) {
+    is(PrefetchState.ENQ_INJECT) {
+      injectQ.io.push.valid := True
+      injectQ.io.push.payload := prefetchCtx
+      when(injectQ.io.push.ready) {
+        prefetchState := PrefetchState.IDLE
+      }
+    }
+
+    is(PrefetchState.ERROR_DRAIN) {
+      readEngineA.io.outReady := True
+      readEngineB.io.outReady := True
+      bFifo.io.pop.ready := bFifo.io.pop.valid
+      when(!readEngineA.io.busy && !readEngineB.io.busy) {
+        prefetchState := PrefetchState.ERROR_STATUS
+      }
+    }
+
+    is(PrefetchState.ERROR_STATUS) {
+      statusGen.io.errValid := True
+      statusGen.io.errCmdId := errorCmdId
+      statusGen.io.errCode := B(0x02, 8 bits)
+      stepDoneErrorPulse := True
+      schedAbort := True
+      bank0ComputeBusy := False
+      bank1ComputeBusy := False
+      bank0DrainBusy := False
+      bank1DrainBusy := False
+      bank0RowBusy := 0
+      bank1RowBusy := 0
+      injectState := InjectState.IDLE
+      drainState := DrainState.IDLE
+      prefetchState := PrefetchState.IDLE
+    }
+  }
+
+  // ---------- Inject engine + hazard scoreboard ----------
+
+  val bankHazardForInject = Bool()
+  bankHazardForInject := False
+  when(injectQ.io.pop.valid) {
+    when(injectQ.io.pop.payload.bankSel) {
+      bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
+    } otherwise {
+      bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
+    }
+  }
+
+  switch(injectState) {
+    is(InjectState.IDLE) {
+      when(schedAbort) {
+        injectQ.io.pop.ready := injectQ.io.pop.valid
+      } elsewhen(injectQ.io.pop.valid && !bankHazardForInject) {
+        injectQ.io.pop.ready := True
+        injectCtx := injectQ.io.pop.payload
+        coreBankSel := injectQ.io.pop.payload.bankSel
+        when(injectQ.io.pop.payload.bankSel) {
+          bank1ComputeBusy := True
+        } otherwise {
+          bank0ComputeBusy := True
+        }
+        feedCnt := 0
+        injectState := InjectState.SWAP_TB
+      }
+    }
+
+    is(InjectState.SWAP_TB) {
       transposeBuffer.io.swap := True
       traceFeedStart := True
       feedCnt := 0
-      feedState := FeedState.FEED
+      injectState := InjectState.FEED
     }
 
-    is(FeedState.FEED) {
-      // Feed transposed A column and B row into systolic core
+    is(InjectState.FEED) {
       transposeBuffer.io.rdColIdx := feedCnt
-
       bFifo.io.pop.ready := True
-
       for (i <- 0 until cfg.s) {
         systolicCore.io.aIn(i) := transposeBuffer.io.rdData(i)
         systolicCore.io.aValid(i) := True
         systolicCore.io.bIn(i) := bFifo.io.pop.payload((i + 1) * 32 - 1 downto i * 32)
         systolicCore.io.bValid(i) := True
       }
-
-      // Clear bank on first cycle of first pk step for this micro-tile
-      when(feedCnt === 0 && stepClearBank) {
+      when(feedCnt === 0 && injectCtx.clearBank) {
         systolicCore.io.clearBank := True
       }
 
       when(feedCnt === U(cfg.s - 1, feedCnt.getWidth bits)) {
-        when(stepDrainTrigger) {
-          // Last pk: wait for tail then drain
+        when(injectCtx.drainTrigger) {
           tailCnt := 0
-          feedState := FeedState.TAIL
+          injectState := InjectState.TAIL
         } otherwise {
-          // More pk steps: advance scheduler
-          tileScheduler.io.stepReady := True
-          feedState := FeedState.NEXT_STEP
+          stepDoneInjectPulse := True
+          when(injectCtx.bankSel) {
+            bank1ComputeBusy := False
+          } otherwise {
+            bank0ComputeBusy := False
+          }
+          injectState := InjectState.IDLE
         }
       } otherwise {
         feedCnt := feedCnt + 1
       }
     }
 
-    is(FeedState.TAIL) {
-      // Wait 2*(S-1) cycles for skew drain
+    is(InjectState.TAIL) {
       if (cfg.s > 1) {
         when(tailCnt === tailTarget) {
-          feedState := FeedState.DRAIN_START
+          injectState := InjectState.ENQ_DRAIN
         } otherwise {
           tailCnt := tailCnt + 1
         }
       } else {
-        feedState := FeedState.DRAIN_START
+        injectState := InjectState.ENQ_DRAIN
       }
     }
 
-    is(FeedState.DRAIN_START) {
-      // One-cycle pulse to start drain
-      traceDrainStart := True
-      drainPacker.io.drainStart := True
-      feedState := FeedState.DRAIN_WAIT
+    is(InjectState.ENQ_DRAIN) {
+      drainQ.io.push.valid := True
+      drainQ.io.push.payload := injectCtx
+      when(drainQ.io.push.ready) {
+        when(injectCtx.bankSel) {
+          bank1ComputeBusy := False
+        } otherwise {
+          bank0ComputeBusy := False
+        }
+        injectState := InjectState.IDLE
+      }
+    }
+  }
+
+  // ---------- Drain engine ----------
+
+  when(drainState =/= DrainState.IDLE) {
+    drainPacker.io.drainBankIn := drainCtx.bankSel
+    drainPacker.io.pi := drainCtx.pi
+    drainPacker.io.pj := drainCtx.pj
+    drainPacker.io.pkCmd := drainCtx.pkCmd
+    drainPacker.io.mi := drainCtx.mi
+    drainPacker.io.nj := drainCtx.nj
+    drainPacker.io.numPkCmd := drainCtx.numPkCmd
+    drainPacker.io.numMi := drainCtx.numMi
+    drainPacker.io.numNj := drainCtx.numNj
+    drainPacker.io.numPi := drainCtx.numPi
+    drainPacker.io.numPj := drainCtx.numPj
+    drainPacker.io.cmdDesc := drainCtx.cmdDesc
+  }
+
+  switch(drainState) {
+    is(DrainState.IDLE) {
+      when(schedAbort) {
+        drainQ.io.pop.ready := drainQ.io.pop.valid
+      } elsewhen(drainQ.io.pop.valid) {
+        drainQ.io.pop.ready := True
+        drainCtx := drainQ.io.pop.payload
+        when(drainQ.io.pop.payload.bankSel) {
+          bank1DrainBusy := True
+          bank1RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
+        } otherwise {
+          bank0DrainBusy := True
+          bank0RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
+        }
+        drainState := DrainState.DRAIN_START
+      }
     }
 
-    is(FeedState.DRAIN_WAIT) {
+    is(DrainState.DRAIN_START) {
+      traceDrainStart := True
+      drainPacker.io.drainStart := True
+      drainState := DrainState.DRAIN_WAIT
+    }
+
+    is(DrainState.DRAIN_WAIT) {
       when(drainPacker.io.drainDone) {
         traceDrainDone := True
-        val lastMiNj = (stepMi === numMi - 1) && (stepNj === numNj - 1)
-        val lastPkCmd = stepPkCmd === numPkCmd - 1
-
+        val lastMiNj = (drainCtx.mi === drainCtx.numMi - 1) && (drainCtx.nj === drainCtx.numNj - 1)
+        val lastPkCmd = drainCtx.pkCmd === drainCtx.numPkCmd - 1
         when(lastMiNj && lastPkCmd) {
-          feedState := FeedState.FLUSH_START
+          drainState := DrainState.FLUSH_START
         } otherwise {
-          tileScheduler.io.stepReady := True
-          feedState := FeedState.NEXT_STEP
+          drainState := DrainState.STEP_DONE
         }
       }
     }
 
-    is(FeedState.FLUSH_START) {
-      // One-cycle pulse to start flush
+    is(DrainState.FLUSH_START) {
       drainPacker.io.flushStart := True
-      feedState := FeedState.FLUSH_D
+      drainState := DrainState.FLUSH_WAIT
     }
 
-    is(FeedState.FLUSH_D) {
+    is(DrainState.FLUSH_WAIT) {
       when(drainPacker.io.flushDone) {
-        tileScheduler.io.stepReady := True
-        feedState := FeedState.NEXT_STEP
+        drainState := DrainState.STEP_DONE
       }
     }
 
-    is(FeedState.CMD_DONE) {
-      // Command fully completed
-      cmdActive := False
-      feedState := FeedState.IDLE
-    }
-
-    is(FeedState.ERROR_DRAIN) {
-      // Drain outstanding reads from both engines
-      readEngineA.io.outReady := True
-      readEngineB.io.outReady := True
-      // Drain B FIFO
-      bFifo.io.pop.ready := bFifo.io.pop.valid
-
-      when(!readEngineA.io.busy && !readEngineB.io.busy) {
-        feedState := FeedState.ERROR_STATUS
+    is(DrainState.STEP_DONE) {
+      stepDoneDrainPulse := True
+      when(drainCtx.bankSel) {
+        bank1DrainBusy := False
+        bank1RowBusy := 0
+      } otherwise {
+        bank0DrainBusy := False
+        bank0RowBusy := 0
       }
-    }
-
-    is(FeedState.ERROR_STATUS) {
-      statusGen.io.errValid := True
-      statusGen.io.errCmdId := errorCmdId
-      statusGen.io.errCode := B(0x02, 8 bits)
-      cmdActive := False
-      feedState := FeedState.IDLE
+      drainState := DrainState.IDLE
     }
   }
 
@@ -623,7 +779,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val aLoadDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
   val bLoadDone = bLoadCnt === U(cfg.s, bLoadCnt.getWidth bits)
 
-  utilInjectFullCycle := (feedState === FeedState.FEED) && bFifo.io.pop.valid
+  utilInjectFullCycle := (injectState === InjectState.FEED) && bFifo.io.pop.valid
   utilStallSample := utilInjectWindowActive && !utilInjectFullCycle
 
   utilStallCauseNoStep := False
@@ -635,16 +791,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   utilStallCauseErrorFlush := False
 
   val stallErrorFlushCond =
-    (feedState === FeedState.ERROR_DRAIN) || (feedState === FeedState.ERROR_STATUS) || errorDetected
+    (prefetchState === PrefetchState.ERROR_DRAIN) ||
+      (prefetchState === PrefetchState.ERROR_STATUS) ||
+      schedAbort
   val stallOutputBackpressureCond =
-    (feedState === FeedState.DRAIN_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
+    (drainState === DrainState.DRAIN_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
   val stallDrainBlockedCond =
-    (feedState === FeedState.TAIL) ||
-      (feedState === FeedState.DRAIN_START) ||
-      ((feedState === FeedState.DRAIN_WAIT) && !drainPacker.io.drainDone && !stallOutputBackpressureCond)
-  val stallBankHazardCond = (feedState === FeedState.FLUSH_START) || (feedState === FeedState.FLUSH_D)
-  val stallANotReadyCond = (feedState === FeedState.LOAD_AB) && !aLoadDone
-  val stallBNotReadyCond = (feedState === FeedState.LOAD_AB) && aLoadDone && !bLoadDone
+    (injectState === InjectState.TAIL) ||
+      (drainState === DrainState.DRAIN_START) ||
+      ((drainState === DrainState.DRAIN_WAIT) && !drainPacker.io.drainDone && !stallOutputBackpressureCond)
+  val stallBankHazardCond = bankHazardForInject
+  val stallANotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && !aLoadDone
+  val stallBNotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && aLoadDone && !bLoadDone
 
   when(utilStallSample) {
     when(stallErrorFlushCond) {
@@ -684,7 +842,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     traceLastDrainDoneCycle := utilTotalCycles
   }
 
-  when((feedState === FeedState.CMD_DONE) || (feedState === FeedState.ERROR_STATUS)) {
+  val cmdPipelineQuiescent =
+    !schedCmdActive &&
+      !tileScheduler.io.busy &&
+      !schedStepWaitingDone &&
+      (prefetchState === PrefetchState.IDLE) &&
+      (injectState === InjectState.IDLE) &&
+      (drainState === DrainState.IDLE) &&
+      !stepIssueQ.io.pop.valid &&
+      !injectQ.io.pop.valid &&
+      !drainQ.io.pop.valid
+
+  when(cmdPipelineQuiescent || (prefetchState === PrefetchState.ERROR_STATUS)) {
     utilInjectWindowActive := False
   }
 

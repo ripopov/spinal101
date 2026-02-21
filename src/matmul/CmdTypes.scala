@@ -31,3 +31,34 @@ case class StatusEntry() extends Bundle {
   val ok = Bool()
   val errCode = Bits(8 bits)
 }
+
+case class DispatchCmdCtx(cfg: SystolicMatmulConfig) extends Bundle {
+  val cmdDesc = CmdDesc(cfg)
+  val numPi = UInt(16 bits)
+  val numPj = UInt(16 bits)
+  val numPkCmd = UInt(16 bits)
+  val numMi = UInt(16 bits)
+  val numNj = UInt(16 bits)
+  val numPk = UInt(16 bits)
+}
+
+case class StepCtx(cfg: SystolicMatmulConfig) extends Bundle {
+  val cmdDesc = CmdDesc(cfg)
+  val numPi = UInt(16 bits)
+  val numPj = UInt(16 bits)
+  val numPkCmd = UInt(16 bits)
+  val numMi = UInt(16 bits)
+  val numNj = UInt(16 bits)
+  val numPk = UInt(16 bits)
+
+  val pi = UInt(16 bits)
+  val pj = UInt(16 bits)
+  val pkCmd = UInt(16 bits)
+  val mi = UInt(16 bits)
+  val nj = UInt(16 bits)
+  val pk = UInt(16 bits)
+
+  val clearBank = Bool()
+  val drainTrigger = Bool()
+  val bankSel = Bool()
+}
