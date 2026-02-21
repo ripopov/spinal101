@@ -1,0 +1,38 @@
+import mill._
+import mill.api.BuildCtx
+import scalalib._
+
+object spinal101 extends ScalaModule {
+  def scalaVersion = "2.12.21"
+
+  private def spinalVersion = "1.14.1"
+
+  override def scalacOptions = Seq(
+    "-deprecation",
+    "-feature",
+    "-unchecked",
+    "-Xplugin-require:idsl-plugin"
+  )
+
+  override def scalacPluginIvyDeps = Agg(
+    mvn"com.github.spinalhdl:spinalhdl-idsl-plugin_2.12:$spinalVersion"
+  )
+
+  override def ivyDeps = Agg(
+    mvn"com.github.spinalhdl:spinalhdl-core_2.12:$spinalVersion",
+    mvn"com.github.spinalhdl:spinalhdl-lib_2.12:$spinalVersion",
+    mvn"com.github.spinalhdl:spinalhdl-sim_2.12:$spinalVersion"
+  )
+
+  override def sources = T.sources(BuildCtx.workspaceRoot / "src")
+
+  override def mainClass = Some("matmul.GenerateFp32MatrixMul")
+
+  object test extends ScalaTests with TestModule.ScalaTest {
+    override def ivyDeps = super.ivyDeps() ++ Agg(
+      mvn"org.scalatest::scalatest:3.2.19"
+    )
+
+    override def sources = T.sources(BuildCtx.workspaceRoot / "test" / "src")
+  }
+}
