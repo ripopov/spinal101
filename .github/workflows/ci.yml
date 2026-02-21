@@ -38,7 +38,7 @@ jobs:
 
       - name: Install Mill 0.12.17
         run: |
-          curl -fsSL https://github.com/com-lihaoyi/mill/releases/download/0.12.17/0.12.17 -o mill
+          curl -fsSL https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/0.12.17/mill-dist-0.12.17-mill.sh -o mill
           chmod +x mill
 
       - name: Build
