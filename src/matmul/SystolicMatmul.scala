@@ -254,6 +254,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val utilStallDrainBlockedCycles = Reg(UInt(64 bits)) init (0)
   val utilStallOutputBackpressureCycles = Reg(UInt(64 bits)) init (0)
   val utilStallErrorFlushCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallPrefetchSetupCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallBankHazardWaitCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallDrainEnqueueBookkeepingCycles = Reg(UInt(64 bits)) init (0)
 
   val utilInjectWindowActive = Reg(Bool()) init (False)
   val utilInjectFullCycle = Bool()
@@ -266,6 +269,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val utilStallCauseDrainBlocked = Bool()
   val utilStallCauseOutputBackpressure = Bool()
   val utilStallCauseErrorFlush = Bool()
+  val utilStallCausePrefetchSetup = Bool()
+  val utilStallCauseBankHazardWait = Bool()
+  val utilStallCauseDrainEnqueueBookkeeping = Bool()
 
   val traceCmdAccepted = Bool()
   val traceFeedStart = Bool()
@@ -293,6 +299,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   utilStallDrainBlockedCycles.simPublic()
   utilStallOutputBackpressureCycles.simPublic()
   utilStallErrorFlushCycles.simPublic()
+  utilStallPrefetchSetupCycles.simPublic()
+  utilStallBankHazardWaitCycles.simPublic()
+  utilStallDrainEnqueueBookkeepingCycles.simPublic()
 
   utilInjectWindowActive.simPublic()
   utilInjectFullCycle.simPublic()
@@ -305,6 +314,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   utilStallCauseDrainBlocked.simPublic()
   utilStallCauseOutputBackpressure.simPublic()
   utilStallCauseErrorFlush.simPublic()
+  utilStallCausePrefetchSetup.simPublic()
+  utilStallCauseBankHazardWait.simPublic()
+  utilStallCauseDrainEnqueueBookkeeping.simPublic()
 
   traceCmdAccepted.simPublic()
   traceFeedStart.simPublic()
@@ -965,6 +977,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   utilStallCauseDrainBlocked := False
   utilStallCauseOutputBackpressure := False
   utilStallCauseErrorFlush := False
+  utilStallCausePrefetchSetup := False
+  utilStallCauseBankHazardWait := False
+  utilStallCauseDrainEnqueueBookkeeping := False
 
   val stallErrorFlushCond =
     (prefetchState === PrefetchState.ERROR_DRAIN) ||
@@ -988,6 +1003,10 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       stallPrefetchControlCond ||
       stallInjectWaitingForPrefetchCond
   val stallBNotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && aLoadDone && !bLoadDone
+  val bucketOutputBackpressureCond = stallOutputBackpressureCond
+  val bucketDrainEnqueueBookkeepingCond = !bucketOutputBackpressureCond && stallInjectDrainBookkeepingCond
+  val bucketBankHazardWaitCond = !bucketOutputBackpressureCond && !bucketDrainEnqueueBookkeepingCond && bankHazardForInject
+  val bucketPrefetchSetupCond = !bucketOutputBackpressureCond && !bucketDrainEnqueueBookkeepingCond && !bucketBankHazardWaitCond
 
   when(utilStallSample) {
     when(stallErrorFlushCond) {
@@ -1004,6 +1023,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       utilStallCauseBNotReady := True
     } otherwise {
       utilStallCauseANotReady := True
+    }
+
+    when(bucketOutputBackpressureCond) {
+      utilStallCauseOutputBackpressure := True
+    } elsewhen (bucketDrainEnqueueBookkeepingCond) {
+      utilStallCauseDrainEnqueueBookkeeping := True
+    } elsewhen (bucketBankHazardWaitCond) {
+      utilStallCauseBankHazardWait := True
+    } elsewhen (bucketPrefetchSetupCond) {
+      utilStallCausePrefetchSetup := True
+    } otherwise {
+      utilStallCausePrefetchSetup := True
     }
   }
 
@@ -1075,5 +1106,14 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   }
   when(utilStallCauseErrorFlush) {
     utilStallErrorFlushCycles := utilStallErrorFlushCycles + 1
+  }
+  when(utilStallCausePrefetchSetup) {
+    utilStallPrefetchSetupCycles := utilStallPrefetchSetupCycles + 1
+  }
+  when(utilStallCauseBankHazardWait) {
+    utilStallBankHazardWaitCycles := utilStallBankHazardWaitCycles + 1
+  }
+  when(utilStallCauseDrainEnqueueBookkeeping) {
+    utilStallDrainEnqueueBookkeepingCycles := utilStallDrainEnqueueBookkeepingCycles + 1
   }
 }

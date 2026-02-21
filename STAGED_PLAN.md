@@ -20,7 +20,7 @@
 - [x] **Stage 12** — Drain/compute overlap with bank rotation
 - [x] **Stage 13** — Multi-command pipelining and in-order commit
 - [x] **Stage 14** — Utilization closure and CI gating
-- [ ] **Stage 15** — Utilization metric hardening and root-cause attribution
+- [x] **Stage 15** — Utilization metric hardening and root-cause attribution
 - [ ] **Stage 16** — Multi-step continuous A/B prefetch
 - [ ] **Stage 17** — Deep staged-tile buffering and injector decoupling
 - [ ] **Stage 18** — Drain decoupling and hazard narrowing
