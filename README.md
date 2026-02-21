@@ -51,3 +51,35 @@ The testbench executes:
 3. Verilated backend (`SpinalSimConfig().withVerilator`)
 
 Expected behavior: all tests pass with numeric agreement versus a Scala FP32 golden model.
+
+## Devcontainer
+
+This repo includes a VS Code devcontainer in `.devcontainer/` with:
+
+- Java 17
+- Mill `0.12.17`
+- Verilator
+- Python + `volare`
+- Docker CLI (for running the OpenLane container flow used in CI)
+
+After opening the folder in the container:
+
+```bash
+# run simulation tests
+mill --no-server spinal101.test
+
+# generate RTL
+mill --no-server spinal101.run
+```
+
+To run local pre-PnR synthesis/STA flow (same script as CI):
+
+```bash
+python3 -m volare enable --pdk sky130 --pdk-root ./.volare-sky130 "$OPEN_PDKS_REV"
+pdk_path="$(python3 -m volare path --pdk sky130 --pdk-root ./.volare-sky130 "$OPEN_PDKS_REV")"
+
+docker run --rm -v "$PWD":"$PWD" -w "$PWD" \
+  -e PDK_ROOT="$pdk_path" -e PDK="$PDK" -e SCL="$SCL" \
+  -e DESIGN_NAME="Fp32MatrixMul" -e RTL_PATH="generated/Fp32MatrixMul.v" \
+  "$OPENLANE_IMAGE" bash .github/scripts/openlane_prepnr.sh
+```

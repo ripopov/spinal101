@@ -1,0 +1,31 @@
+{
+  "name": "spinal101-dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "enableNonRootDocker": true
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "remoteUser": "vscode",
+  "containerEnv": {
+    "MILL_VERSION": "0.12.17",
+    "OPENLANE_IMAGE": "ghcr.io/efabless/openlane2:2.0.4",
+    "OPEN_PDKS_REV": "0fe599b2afb6708d281543108caf8310912f54af",
+    "PDK": "sky130A",
+    "SCL": "sky130_fd_sc_hd"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "scalameta.metals",
+        "ms-azuretools.vscode-docker",
+        "github.vscode-github-actions"
+      ]
+    }
+  }
+}

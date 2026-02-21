@@ -1,3 +1,6 @@
 out/
 generated/
 simWorkspace/
+.volare-sky130/
+build/openlane_prepnr/
+build/ci/
