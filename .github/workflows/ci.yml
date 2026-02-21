@@ -83,6 +83,9 @@ jobs:
       worst_slack_ns: ${{ steps.export_metrics.outputs.worst_slack_ns }}
       critical_path_ns: ${{ steps.export_metrics.outputs.critical_path_ns }}
       max_frequency_mhz: ${{ steps.export_metrics.outputs.max_frequency_mhz }}
+      critical_startpoint: ${{ steps.export_metrics.outputs.critical_startpoint }}
+      critical_endpoint: ${{ steps.export_metrics.outputs.critical_endpoint }}
+      critical_path_delay_ns: ${{ steps.export_metrics.outputs.critical_path_delay_ns }}
 
     steps:
       - name: Checkout
@@ -165,6 +168,9 @@ jobs:
           echo "worst_slack_ns=${worst_slack_ns}" >> "$GITHUB_OUTPUT"
           echo "critical_path_ns=${critical_path_ns}" >> "$GITHUB_OUTPUT"
           echo "max_frequency_mhz=${max_frequency_mhz}" >> "$GITHUB_OUTPUT"
+          echo "critical_startpoint=${critical_startpoint}" >> "$GITHUB_OUTPUT"
+          echo "critical_endpoint=${critical_endpoint}" >> "$GITHUB_OUTPUT"
+          echo "critical_path_delay_ns=${critical_path_delay_ns}" >> "$GITHUB_OUTPUT"
 
       - name: OpenLane Summary
         if: ${{ always() }}
@@ -199,6 +205,9 @@ jobs:
           MAX_FREQUENCY_MHZ: ${{ needs.openlane-prepnr.outputs.max_frequency_mhz }}
           WORST_SLACK_NS: ${{ needs.openlane-prepnr.outputs.worst_slack_ns }}
           CRITICAL_PATH_NS: ${{ needs.openlane-prepnr.outputs.critical_path_ns }}
+          CRITICAL_STARTPOINT: ${{ needs.openlane-prepnr.outputs.critical_startpoint }}
+          CRITICAL_ENDPOINT: ${{ needs.openlane-prepnr.outputs.critical_endpoint }}
+          CRITICAL_PATH_DELAY_NS: ${{ needs.openlane-prepnr.outputs.critical_path_delay_ns }}
         run: |
           echo "## CI Result Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -209,4 +218,7 @@ jobs:
           echo "| Gate count (std cells) | ${GATE_COUNT:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Worst slack (ns) | ${WORST_SLACK_NS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Critical path estimate (ns) | ${CRITICAL_PATH_NS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Critical path delay (report_checks, ns) | ${CRITICAL_PATH_DELAY_NS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Critical path startpoint | ${CRITICAL_STARTPOINT:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Critical path endpoint | ${CRITICAL_ENDPOINT:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Max frequency estimate (MHz) | ${MAX_FREQUENCY_MHZ:-n/a} |" >> "$GITHUB_STEP_SUMMARY"

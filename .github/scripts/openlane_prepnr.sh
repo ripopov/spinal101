@@ -100,11 +100,32 @@ if [[ "$worst_slack_ns" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
   max_frequency_mhz="$(python3 -c 'import sys; crit=float(sys.argv[1]); print(f"{1000.0/crit:.3f}" if crit > 0 else "n/a")' "$critical_path_ns")"
 fi
 
+critical_startpoint="$(grep -m1 -E '^Startpoint:' "$checks_rpt" | sed -E 's/^Startpoint:[[:space:]]*//; s/[[:space:]]+$//' || true)"
+if [[ -z "$critical_startpoint" ]]; then
+  critical_startpoint="n/a"
+fi
+
+critical_endpoint="$(grep -m1 -E '^Endpoint:' "$checks_rpt" | sed -E 's/^Endpoint:[[:space:]]*//; s/[[:space:]]+$//' || true)"
+if [[ -z "$critical_endpoint" ]]; then
+  critical_endpoint="n/a"
+fi
+
+critical_path_delay_ns="$(grep -m1 -E 'data arrival time' "$checks_rpt" | grep -Eo '[-]?[0-9]+([.][0-9]+)?' | tail -n1 || true)"
+if [[ -z "$critical_path_delay_ns" ]]; then
+  critical_path_delay_ns="n/a"
+fi
+
+critical_startpoint_esc="$(printf '%q' "$critical_startpoint")"
+critical_endpoint_esc="$(printf '%q' "$critical_endpoint")"
+
 cat > "$metrics_env" <<EOF
 gate_count=$gate_count
 worst_slack_ns=$worst_slack_ns
 critical_path_ns=$critical_path_ns
 max_frequency_mhz=$max_frequency_mhz
+critical_startpoint=$critical_startpoint_esc
+critical_endpoint=$critical_endpoint_esc
+critical_path_delay_ns=$critical_path_delay_ns
 target_period_ns=$TARGET_PERIOD_NS
 synth_netlist=$synth_netlist
 def_file=$def_file
@@ -119,6 +140,9 @@ cat > "$summary_md" <<EOF
 | Target clock period | ${TARGET_PERIOD_NS} ns |
 | Worst slack | ${worst_slack_ns} ns |
 | Critical path estimate | ${critical_path_ns} ns |
+| Critical path delay (report_checks) | ${critical_path_delay_ns} ns |
+| Critical path startpoint | \`$critical_startpoint\` |
+| Critical path endpoint | \`$critical_endpoint\` |
 | Max frequency estimate | ${max_frequency_mhz} MHz |
 
 Artifacts:
