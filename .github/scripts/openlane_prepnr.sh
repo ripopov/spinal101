@@ -74,14 +74,6 @@ initialize_floorplan -site unithd -die_area {0 0 500 500} -core_area {10 10 490 
 write_def $def_file
 
 create_clock -name core_clk -period $TARGET_PERIOD_NS [get_ports $CLOCK_PORT]
-set in_ports [remove_from_collection [all_inputs] [get_ports {$CLOCK_PORT reset rst rst_n}]]
-if {[llength \$in_ports] > 0} {
-  set_input_delay -clock core_clk 0 \$in_ports
-}
-set out_ports [all_outputs]
-if {[llength \$out_ports] > 0} {
-  set_output_delay -clock core_clk 0 \$out_ports
-}
 
 report_checks -path_delay max -digits 4 > $checks_rpt
 report_worst_slack -max > $slack_rpt
