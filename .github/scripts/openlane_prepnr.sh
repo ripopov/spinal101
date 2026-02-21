@@ -96,8 +96,8 @@ fi
 critical_path_ns="n/a"
 max_frequency_mhz="n/a"
 if [[ "$worst_slack_ns" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
-  critical_path_ns="$(awk -v period="$TARGET_PERIOD_NS" -v slack="$worst_slack_ns" 'BEGIN {printf "%.4f", period - slack}')"
-  max_frequency_mhz="$(awk -v crit="$critical_path_ns" 'BEGIN {if (crit > 0) printf "%.3f", 1000/crit; else print "n/a"}')"
+  critical_path_ns="$(python3 -c 'import sys; period=float(sys.argv[1]); slack=float(sys.argv[2]); print(f"{period - slack:.4f}")' "$TARGET_PERIOD_NS" "$worst_slack_ns")"
+  max_frequency_mhz="$(python3 -c 'import sys; crit=float(sys.argv[1]); print(f"{1000.0/crit:.3f}" if crit > 0 else "n/a")' "$critical_path_ns")"
 fi
 
 cat > "$metrics_env" <<EOF
