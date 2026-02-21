@@ -47,7 +47,6 @@ def_file="$WORK_DIR/${DESIGN_NAME}_prepnr.def"
 yosys_log="$WORK_DIR/yosys.log"
 openroad_log="$WORK_DIR/openroad.log"
 checks_rpt="$WORK_DIR/opensta_checks.rpt"
-slack_rpt="$WORK_DIR/opensta_worst_slack.rpt"
 metrics_env="$WORK_DIR/metrics.env"
 summary_md="$WORK_DIR/summary.md"
 
@@ -75,20 +74,21 @@ write_def $def_file
 
 create_clock -name core_clk -period $TARGET_PERIOD_NS [get_ports $CLOCK_PORT]
 
-report_checks -path_delay max -digits 4 > $checks_rpt
-report_worst_slack -max > $slack_rpt
-report_design_area > $WORK_DIR/openroad_area.rpt
+report_checks -path_delay max -digits 4
+report_worst_slack -max
+report_design_area
 exit
 EOF
 
 openroad -exit "$WORK_DIR/prepnr_sta.tcl" > "$openroad_log" 2>&1
+cp "$openroad_log" "$checks_rpt"
 
-gate_count="$(awk '/Number of cells:/ {cells=$4} END {print cells}' "$yosys_log")"
+gate_count="$(awk '/Number of cells:/ {cells=$4} END {print cells}' "$yosys_log" || true)"
 if [[ -z "$gate_count" ]]; then
   gate_count="n/a"
 fi
 
-worst_slack_ns="$(awk '/worst slack/ {print $3}' "$slack_rpt" | tail -n1)"
+worst_slack_ns="$(awk '/worst slack/ {value=$3} END {print value}' "$openroad_log" || true)"
 if [[ -z "$worst_slack_ns" ]]; then
   worst_slack_ns="n/a"
 fi
