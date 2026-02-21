@@ -6,7 +6,7 @@
 ## Current Status
 
 - [x] **Stage 0** — Scaffold and CI green baseline
-- [ ] **Stage 1** — Scala reference model
+- [x] **Stage 1** — Scala reference model
 - [ ] **Stage 2** — Testbench infrastructure (memory model + scoreboard)
 - [ ] **Stage 3** — RTL: PE and pipelined FP32 datapath
 - [ ] **Stage 4** — RTL: Systolic core (S x S array + skew networks)
