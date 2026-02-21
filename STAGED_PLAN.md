@@ -10,7 +10,7 @@
 - [x] **Stage 2** — Testbench infrastructure (memory model + scoreboard)
 - [x] **Stage 3** — RTL: PE and pipelined FP32 datapath
 - [x] **Stage 4** — RTL: Systolic core (S x S array + skew networks)
-- [ ] **Stage 5** — RTL: Memory engines, transpose buffer, command frontend
+- [x] **Stage 5** — RTL: Memory engines, transpose buffer, command frontend
 - [ ] **Stage 6** — RTL: Drain, output packer, status — full top-level integration
 - [ ] **Stage 7** — Performance tests (throughput and overlap contracts)
 - [ ] **Stage 8** — Pre-PnR STA and timing closure
