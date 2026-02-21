@@ -157,6 +157,8 @@ final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessC
     }
   }
 
+  def utilStallNoStepCycles: BigInt = dut.utilStallNoStepCycles.toBigInt
+
   private def compareOutputAgainstExpected(cmd: CommandDesc, expectedD: Array[Int]): Option[String] = {
     val expectedByAddr = packExpectedDCacheLines(cmd, expectedD)
     expectedByAddr.collectFirst {
@@ -352,9 +354,18 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
         tb.enqueueCommand(cmd, a, b)
       }
 
-      queued.foreach { q =>
+      assert(tb.awaitCommand(queued.head).isInstanceOf[CommandSuccess], s"failed cmdId=${queued.head.cmd.cmdId}")
+      val warmupNoStep = tb.utilStallNoStepCycles
+
+      queued.slice(1, queued.length - 1).foreach { q =>
         assert(tb.awaitCommand(q).isInstanceOf[CommandSuccess], s"failed cmdId=${q.cmd.cmdId}")
       }
+
+      val steadyNoStep = tb.utilStallNoStepCycles
+      assert(steadyNoStep == warmupNoStep, s"no_step bubbles observed after warm-up: warmup=$warmupNoStep steady=$steadyNoStep")
+
+      val last = queued.last
+      assert(tb.awaitCommand(last).isInstanceOf[CommandSuccess], s"failed cmdId=${last.cmd.cmdId}")
 
       val fireCycles = tb.out.fireCycles.toSeq
       val expectedBeats = cmds.map(c => c.m * (c.ldd / s)).sum
@@ -372,6 +383,73 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
 
       assert(smallGapRatio >= 0.80, f"too many wide output bubbles: smallGapRatio=$smallGapRatio%.3f")
       assert(largeGapCount <= (cmdCount * 4), s"too many large output bubbles: count=$largeGapCount")
+    }
+  }
+
+  test("integration error fence poisons younger queued commands and resumes cleanly") {
+    val base = defaultHarnessConfigS4()
+    val cfg = base.copy(
+      memoryCfg = MemoryAgentConfig(
+        clBytes = base.dutCfg.clBytes,
+        latencyModel = MemoryLatencyModel.Fixed(0),
+        reorderWindow = 0,
+        injectErrEvery = 9,
+        seed = 73
+      )
+    )
+    runCase("systolic_int_error_fence_resume", cfg) { tb =>
+      val s = cfg.dutCfg.s
+      def mkSmallCmd(cmdId: Int, base: BigInt): CommandDesc =
+        CommandDesc(
+          cmdId = cmdId,
+          aBase = base,
+          bBase = base + BigInt(0x10000),
+          dBase = base + BigInt(0x20000),
+          m = s,
+          n = s,
+          k = s,
+          lda = s,
+          ldb = s,
+          ldd = s,
+          primM = s,
+          primN = s,
+          primK = s
+        )
+
+      val cmd700 = mkSmallCmd(700, 0x1100000L)
+      val cmd701 = mkSmallCmd(701, 0x1130000L)
+      assert(tb.runCommand(cmd700, mkRows(s, s, s, 200), mkRows(s, s, s, 201)).isInstanceOf[CommandSuccess], "warm-up cmd700 failed")
+      assert(tb.runCommand(cmd701, mkRows(s, s, s, 202), mkRows(s, s, s, 203)).isInstanceOf[CommandSuccess], "warm-up cmd701 failed")
+
+      val queuedErr = Seq(
+        tb.enqueueCommand(mkSmallCmd(702, 0x1160000L), mkRows(s, s, s, 204), mkRows(s, s, s, 205)),
+        tb.enqueueCommand(mkSmallCmd(703, 0x1190000L), mkRows(s, s, s, 206), mkRows(s, s, s, 207))
+      )
+
+      queuedErr.foreach { q =>
+        val res = tb.awaitCommand(q)
+        assert(res.isInstanceOf[CommandFailure], s"expected fenced failure for cmdId=${q.cmd.cmdId}")
+        assert(res.asInstanceOf[CommandFailure].reason.contains("err_code"), s"unexpected failure for cmdId=${q.cmd.cmdId}: $res")
+      }
+
+      val resumeCmd = CommandDesc(
+        cmdId = 704,
+        aBase = 0x11c0000L,
+        bBase = 0x11d0000L,
+        dBase = 0x11e0000L,
+        m = s,
+        n = s,
+        k = s,
+        lda = s,
+        ldb = s,
+        ldd = s,
+        primM = s,
+        primN = s,
+        primK = s
+      )
+      val resumeA = mkRows(s, s, s, 220)
+      val resumeB = mkRows(s, s, s, 221)
+      assert(tb.runCommand(resumeCmd, resumeA, resumeB).isInstanceOf[CommandSuccess], "resume command failed after fenced error")
     }
   }
 

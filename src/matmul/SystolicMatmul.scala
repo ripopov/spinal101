@@ -86,7 +86,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val readEngineB = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd)
   val systolicCore = SystolicCore(cfg.s, cfg.lMul, cfg.lAdd)
   val drainPacker = DrainPacker(cfg)
-  val statusGen = StatusGen(cfg)
 
   // A ping-pong staging buffers (each bank stores one SxS tile as rows).
   val aStageBank0 = Vec(Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s), cfg.s)
@@ -99,9 +98,24 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   // Output FIFO between DrainPacker and d_wr_* ports
   val outFifo = StreamFifo(DWriteEntry(cfg), cfg.outFifoDepthCl)
 
+  // In-order commit queue for status emission.
+  val commitDepth = 1 << log2Up((cfg.cmdqDepth * 4).max(8))
+  val commitPtrW = log2Up(commitDepth)
+  val commitCountW = log2Up(commitDepth + 1)
+  val commitHead = Reg(UInt(commitPtrW bits)) init (0)
+  val commitTail = Reg(UInt(commitPtrW bits)) init (0)
+  val commitCount = Reg(UInt(commitCountW bits)) init (0)
+  val commitCmdId = Vec(Reg(UInt(16 bits)) init (0), commitDepth)
+  val commitWritesDone = Vec(Reg(Bool()) init (False), commitDepth)
+  val commitDrainsDone = Vec(Reg(Bool()) init (False), commitDepth)
+  val commitErrorsSeen = Vec(Reg(Bool()) init (False), commitDepth)
+  val commitErrCode = Vec(Reg(Bits(8 bits)) init (0), commitDepth)
+  val commitQueueFull = commitCount === U(commitDepth, commitCountW bits)
+  val commitCanAccept = !commitQueueFull
+
   // ---------- Command Frontend Wiring ----------
 
-  cmdFrontend.io.cmdValid := io.cmd_valid
+  cmdFrontend.io.cmdValid := io.cmd_valid && commitCanAccept
   cmdFrontend.io.cmdDesc.cmdId := io.cmd_desc_cmd_id
   cmdFrontend.io.cmdDesc.aBase := io.cmd_desc_a_base
   cmdFrontend.io.cmdDesc.bBase := io.cmd_desc_b_base
@@ -116,7 +130,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   cmdFrontend.io.cmdDesc.primN := io.cmd_desc_prim_n
   cmdFrontend.io.cmdDesc.primK := io.cmd_desc_prim_k
   cmdFrontend.io.cmdDesc.flags := io.cmd_desc_flags
-  io.cmd_ready := cmdFrontend.io.cmdReady
+  io.cmd_ready := cmdFrontend.io.cmdReady && commitCanAccept
 
   // ---------- Read Engine <-> External Memory ----------
 
@@ -151,19 +165,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   val dWriteLastFire = io.d_wr_valid && io.d_wr_ready && io.d_wr_last
 
-  // ---------- Status Gen -> sts_* ----------
-
-  io.sts_valid := statusGen.io.stsValid
-  io.sts_cmd_id := statusGen.io.stsCmdId
-  io.sts_ok := statusGen.io.stsOk
-  io.sts_err_code := statusGen.io.stsErrCode
-  statusGen.io.stsReady := io.sts_ready
-
-  // Rejection path from CmdFrontend -> StatusGen
-  statusGen.io.rejValid := cmdFrontend.io.rejValid
-  cmdFrontend.io.rejReady := statusGen.io.rejReady
-  statusGen.io.rejCmdId := cmdFrontend.io.rejCmdId
-  statusGen.io.rejErrCode := cmdFrontend.io.rejErrCode
+  cmdFrontend.io.rejReady := True
 
   // ---------- DrainPacker -> Output FIFO ----------
 
@@ -179,11 +181,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   systolicCore.io.drainBank := drainPacker.io.drainBank
   systolicCore.io.drainRow := drainPacker.io.drainRow
   drainPacker.io.drainData := systolicCore.io.drainData
-
-  // ---------- d_wr completion -> StatusGen ----------
-
-  statusGen.io.cmdDoneValid := dWriteLastFire
-  statusGen.io.cmdDoneCmdId := io.d_wr_cmd_id
 
   // ---------- Controller decomposition ----------
 
@@ -227,6 +224,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val schedAbort = Reg(Bool()) init (False)
   val errorDetected = Reg(Bool()) init (False)
   val errorCmdId = Reg(UInt(16 bits)) init (0)
+  val flushCmdLastPending = Reg(Bool()) init (False)
 
   val aLoadCnt = Reg(UInt(log2Up(cfg.s + 1) bits)) init (0)
   val bLoadCnt = Reg(UInt(log2Up(cfg.s + 1) bits)) init (0)
@@ -421,15 +419,22 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   drainPacker.io.cmdDesc.primK := 0
   drainPacker.io.cmdDesc.flags := 0
 
-  // StatusGen error defaults
-  statusGen.io.errValid := False
-  statusGen.io.errCmdId := errorCmdId
-  statusGen.io.errCode := B(0x02, 8 bits) // readErr
-
   traceCmdAccepted := False
   traceFeedStart := False
   traceDrainStart := False
   traceDrainDone := False
+
+  val poisonReqValid = Bool()
+  val poisonReqCmdId = UInt(16 bits)
+  val poisonReqErrCode = Bits(8 bits)
+  poisonReqValid := False
+  poisonReqCmdId := 0
+  poisonReqErrCode := B(0x02, 8 bits) // readErr
+
+  val drainCmdDoneValid = Bool()
+  val drainCmdDoneCmdId = UInt(16 bits)
+  drainCmdDoneValid := False
+  drainCmdDoneCmdId := 0
 
   // ---------- Address computation ----------
 
@@ -456,7 +461,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   // ---------- Command dispatch engine ----------
 
   cmdDispatchQ.io.push.valid := cmdFrontend.io.outValid && !schedAbort
-  cmdFrontend.io.outReady := cmdDispatchQ.io.push.ready && !schedAbort
+  cmdFrontend.io.outReady := cmdDispatchQ.io.push.ready || schedAbort
   when(cmdDispatchQ.io.push.fire) {
     traceCmdAccepted := True
   }
@@ -482,23 +487,16 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   emittedStep.bankSel := tileScheduler.io.bankSel
   stepIssueQ.io.push.payload := emittedStep
 
-  val cmdPipelineIdleForDispatch =
-    !schedCmdActive &&
-      (prefetchState === PrefetchState.IDLE) &&
-      (injectState === InjectState.IDLE) &&
-      (drainState === DrainState.IDLE) &&
-      !stepIssueQ.io.pop.valid &&
-      !injectQ.io.pop.valid &&
-      !injectBankQ.io.pop.valid &&
-      !drainQ.io.pop.valid &&
-      !drainDelayQ.io.pop.valid &&
-      !drainPendingValid &&
-      !stageBankValid0 &&
-      !stageBankValid1 &&
-      !readEngineA.io.busy &&
-      !readEngineB.io.busy
-
-  when(cmdPipelineIdleForDispatch && !schedAbort) {
+  when(schedAbort) {
+    cmdDispatchQ.io.pop.ready := cmdDispatchQ.io.pop.valid
+    stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
+    when(tileScheduler.io.busy && tileScheduler.io.stepValid) {
+      tileScheduler.io.stepReady := True
+    } elsewhen (!tileScheduler.io.busy) {
+      schedAbort := False
+      schedCmdActive := False
+    }
+  } elsewhen (!schedCmdActive) {
     tileScheduler.io.cmdValid := cmdDispatchQ.io.pop.valid
     tileScheduler.io.cmdDesc := cmdDispatchQ.io.pop.payload.cmdDesc
     cmdDispatchQ.io.pop.ready := tileScheduler.io.cmdReady
@@ -507,23 +505,14 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       schedCmdActive := True
       errorDetected := False
     }
-  } elsewhen (schedAbort) {
-    stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
-    when(tileScheduler.io.busy && tileScheduler.io.stepValid) {
-      tileScheduler.io.stepReady := True
-    } elsewhen (!tileScheduler.io.busy) {
-      schedAbort := False
-      schedCmdActive := False
-    }
-  } elsewhen (schedCmdActive) {
+  } otherwise {
     when(tileScheduler.io.stepValid && stepIssueQ.io.push.ready) {
       stepIssueQ.io.push.valid := True
       tileScheduler.io.stepReady := True
     }
-  }
-
-  when(dWriteLastFire && schedCmdActive && (io.d_wr_cmd_id === schedCmdCtx.cmdDesc.cmdId)) {
-    schedCmdActive := False
+    when(!tileScheduler.io.busy) {
+      schedCmdActive := False
+    }
   }
 
   // ---------- Prefetch/issue engine ----------
@@ -627,9 +616,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     }
 
     is(PrefetchState.ERROR_STATUS) {
-      statusGen.io.errValid := True
-      statusGen.io.errCmdId := errorCmdId
-      statusGen.io.errCode := B(0x02, 8 bits)
+      poisonReqValid := True
+      poisonReqCmdId := errorCmdId
+      poisonReqErrCode := B(0x02, 8 bits)
       schedAbort := True
       bank0ComputeBusy := False
       bank1ComputeBusy := False
@@ -640,6 +629,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       stageBankValid0 := False
       stageBankValid1 := False
       drainPendingValid := False
+      flushCmdLastPending := False
       injectState := InjectState.IDLE
       drainState := DrainState.IDLE
       prefetchState := PrefetchState.IDLE
@@ -842,9 +832,12 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         }
         val lastMiNj = (drainCtx.mi === drainCtx.numMi - 1) && (drainCtx.nj === drainCtx.numNj - 1)
         val lastPkCmd = drainCtx.pkCmd === drainCtx.numPkCmd - 1
+        val lastPiPj = (drainCtx.pi === drainCtx.numPi - 1) && (drainCtx.pj === drainCtx.numPj - 1)
         when(lastMiNj && lastPkCmd) {
+          flushCmdLastPending := lastPiPj
           drainState := DrainState.FLUSH_REQ
         } otherwise {
+          flushCmdLastPending := False
           drainState := DrainState.IDLE
         }
       }
@@ -859,10 +852,102 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
     is(DrainState.FLUSH_WAIT) {
       when(drainPacker.io.flushDone) {
+        when(flushCmdLastPending) {
+          drainCmdDoneValid := True
+          drainCmdDoneCmdId := drainCtx.cmdDesc.cmdId
+        }
+        flushCmdLastPending := False
         drainState := DrainState.IDLE
       }
     }
 
+  }
+
+  // ---------- In-order commit queue / status commit ----------
+
+  val commitHeadReady =
+    (commitCount =/= 0) &&
+      (commitErrorsSeen(commitHead) || (commitWritesDone(commitHead) && commitDrainsDone(commitHead)))
+  val commitHeadCmdId = commitCmdId(commitHead)
+  val commitHeadErrCode = commitErrCode(commitHead)
+  val commitHeadErr = commitErrorsSeen(commitHead)
+
+  io.sts_valid := commitHeadReady
+  io.sts_cmd_id := Mux(commitCount =/= 0, commitHeadCmdId, U(0, 16 bits))
+  io.sts_ok := (commitCount =/= 0) && !commitHeadErr
+  io.sts_err_code := Mux((commitCount =/= 0) && commitHeadErr, commitHeadErrCode, B(0, 8 bits))
+
+  val commitPopFire = io.sts_valid && io.sts_ready
+  val commitPushFire = cmdFrontend.io.acceptFire && commitCanAccept
+
+  val poisonMatchByDist = Bits(commitDepth bits)
+  poisonMatchByDist := B(0, commitDepth bits)
+  for (dist <- 0 until commitDepth) {
+    val distU = U(dist, commitCountW bits)
+    val idx = (commitHead + U(dist, commitPtrW bits)).resized
+    val active = distU < commitCount
+    poisonMatchByDist(dist) := poisonReqValid && active && (commitCmdId(idx) === poisonReqCmdId)
+  }
+
+  val poisonHit = poisonMatchByDist.orR
+  val poisonDist = UInt(commitCountW bits)
+  poisonDist := 0
+  var priorHit: Bool = False
+  for (dist <- 0 until commitDepth) {
+    val hit = poisonMatchByDist(dist)
+    when(!priorHit && hit) {
+      poisonDist := U(dist, commitCountW bits)
+    }
+    priorHit = priorHit || hit
+  }
+
+  for (i <- 0 until commitDepth) {
+    val idx = U(i, commitPtrW bits)
+    val dist = (idx - commitHead).resize(commitCountW)
+    val active = dist < commitCount
+
+    when(dWriteLastFire && active && (commitCmdId(i) === io.d_wr_cmd_id)) {
+      commitWritesDone(i) := True
+    }
+
+    when(drainCmdDoneValid && active && (commitCmdId(i) === drainCmdDoneCmdId)) {
+      commitDrainsDone(i) := True
+    }
+
+    val poisonAllActive = poisonReqValid && !poisonHit
+    val poisonThis = poisonReqValid && active && (poisonAllActive || (dist >= poisonDist))
+    when(poisonThis) {
+      commitErrorsSeen(i) := True
+      commitErrCode(i) := poisonReqErrCode
+      commitWritesDone(i) := True
+      commitDrainsDone(i) := True
+    }
+  }
+
+  when(commitPopFire) {
+    commitCmdId(commitHead) := U(0, 16 bits)
+    commitWritesDone(commitHead) := False
+    commitDrainsDone(commitHead) := False
+    commitErrorsSeen(commitHead) := False
+    commitErrCode(commitHead) := B(0, 8 bits)
+    commitHead := (commitHead + 1).resized
+  }
+
+  when(commitPushFire) {
+    commitCmdId(commitTail) := cmdFrontend.io.acceptCmdId
+    commitWritesDone(commitTail) := cmdFrontend.io.acceptRejected
+    commitDrainsDone(commitTail) := cmdFrontend.io.acceptRejected
+    commitErrorsSeen(commitTail) := cmdFrontend.io.acceptRejected
+    commitErrCode(commitTail) := cmdFrontend.io.acceptErrCode
+    commitTail := (commitTail + 1).resized
+  }
+
+  when(commitPopFire =/= commitPushFire) {
+    when(commitPopFire) {
+      commitCount := commitCount - 1
+    } otherwise {
+      commitCount := commitCount + 1
+    }
   }
 
   // ---------- Utilization/Trace Counter Updates ----------
@@ -889,8 +974,19 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     (drainState === DrainState.FLUSH_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
   val stallDrainBlockedCond =
     (injectState === InjectState.ENQ_DRAIN) && !(drainQ.io.push.ready && drainDelayQ.io.push.ready)
-  val stallBankHazardCond = bankHazardForInject
-  val stallANotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && !aLoadDone
+  val stallInjectDrainBookkeepingCond = injectState === InjectState.ENQ_DRAIN
+  val stallBankHazardCond = bankHazardForInject || stallInjectDrainBookkeepingCond
+  val stallPrefetchControlCond =
+    (prefetchState === PrefetchState.START_READS) ||
+      (prefetchState === PrefetchState.ENQ_INJECT)
+  val stallInjectWaitingForPrefetchCond =
+    (injectState === InjectState.IDLE) &&
+      !injectQ.io.pop.valid &&
+      (prefetchState =/= PrefetchState.IDLE || stepIssueQ.io.pop.valid || readEngineA.io.busy || readEngineB.io.busy)
+  val stallANotReadyCond =
+    ((prefetchState === PrefetchState.LOAD_AB) && !aLoadDone) ||
+      stallPrefetchControlCond ||
+      stallInjectWaitingForPrefetchCond
   val stallBNotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && aLoadDone && !bLoadDone
 
   when(utilStallSample) {
@@ -907,7 +1003,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     } elsewhen (stallBNotReadyCond) {
       utilStallCauseBNotReady := True
     } otherwise {
-      utilStallCauseNoStep := True
+      utilStallCauseANotReady := True
     }
   }
 

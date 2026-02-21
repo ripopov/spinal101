@@ -22,6 +22,12 @@ case class CmdFrontend(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
     val rejReady = in Bool()
     val rejCmdId = out UInt(16 bits)
     val rejErrCode = out Bits(8 bits)
+
+    // Input-handshake event for in-order commit tracking.
+    val acceptFire = out Bool()
+    val acceptCmdId = out UInt(16 bits)
+    val acceptRejected = out Bool()
+    val acceptErrCode = out Bits(8 bits)
   }
 
   val fifo = StreamFifo(CmdDesc(cfg), cfg.cmdqDepth)
@@ -101,4 +107,9 @@ case class CmdFrontend(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   io.rejValid := rejPending
   io.rejCmdId := rejCmdIdReg
   io.rejErrCode := rejErrReg
+
+  io.acceptFire := io.cmdValid && io.cmdReady
+  io.acceptCmdId := io.cmdDesc.cmdId
+  io.acceptRejected := io.acceptFire && !isValidDesc
+  io.acceptErrCode := Mux(io.acceptRejected, CmdErrorCode.invalid, CmdErrorCode.none)
 }
