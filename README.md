@@ -83,3 +83,14 @@ docker run --rm -v "$PWD":"$PWD" -w "$PWD" \
   -e DESIGN_NAME="Fp32MatrixMul" -e RTL_PATH="generated/Fp32MatrixMul.v" \
   "$OPENLANE_IMAGE" bash .github/scripts/openlane_prepnr.sh
 ```
+
+With the repository `Makefile`, pre-PnR defaults to a smaller 4x4 systolic configuration.
+You can override it explicitly:
+
+```bash
+# smaller/faster pre-PnR (default)
+make prepnr PREPNR_S=4
+
+# full-size pre-PnR
+make prepnr PREPNR_S=16
+```

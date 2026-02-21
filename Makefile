@@ -18,6 +18,8 @@ WORK_DIR ?= build/openlane_prepnr
 
 CLOCK_PORT ?= clk
 TARGET_PERIOD_NS ?= 10.0
+SYSTOLIC_S ?= 16
+PREPNR_S ?= 4
 
 .PHONY: help build test rtl rtl-systolic prepnr report flow clean-prepnr
 
@@ -25,7 +27,7 @@ help:
 	@echo "Targets:"
 	@echo "  make test         - Run Scala/Verilator testbench"
 	@echo "  make rtl          - Generate V0 RTL (default 2x2)"
-	@echo "  make rtl-systolic - Generate SystolicMatmul RTL"
+	@echo "  make rtl-systolic - Generate SystolicMatmul RTL (SYSTOLIC_S)"
 	@echo "  make prepnr       - Run OpenLane pre-PnR synthesis/STA flow"
 	@echo "  make report       - Print timing/gate-count summary"
 	@echo "  make flow         - End-to-end: test + rtl + prepnr + report"
@@ -35,6 +37,8 @@ help:
 	@echo "  OPENLANE_IMAGE=$(OPENLANE_IMAGE)"
 	@echo "  OPEN_PDKS_REV=$(OPEN_PDKS_REV)"
 	@echo "  TARGET_PERIOD_NS=$(TARGET_PERIOD_NS)"
+	@echo "  SYSTOLIC_S=$(SYSTOLIC_S)"
+	@echo "  PREPNR_S=$(PREPNR_S)"
 
 build:
 	$(MILL) $(MILL_NO_SERVER) spinal101.compile
@@ -46,9 +50,10 @@ rtl:
 	$(MILL) $(MILL_NO_SERVER) spinal101.run
 
 rtl-systolic:
-	$(MILL) $(MILL_NO_SERVER) spinal101.runMain matmul.GenerateSystolicMatmul
+	$(MILL) $(MILL_NO_SERVER) spinal101.runMain matmul.GenerateSystolicMatmul $(SYSTOLIC_S)
 
-prepnr: rtl-systolic
+prepnr:
+	@$(MAKE) rtl-systolic SYSTOLIC_S="$(PREPNR_S)"
 	@pdk_path="$(OPENLANE_PDK_ROOT)"; \
 	if [[ -z "$$pdk_path" ]]; then \
 		pdk_path="$$(python3 -m volare path --pdk $(PDK_FAMILY) --pdk-root $(PDK_ROOT_CACHE) $(OPEN_PDKS_REV))"; \

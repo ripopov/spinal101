@@ -118,9 +118,6 @@ jobs:
           curl -fsSL "https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/${MILL_VERSION}/mill-dist-${MILL_VERSION}-mill.sh" -o mill
           chmod +x mill
 
-      - name: Generate RTL
-        run: ./mill --no-server spinal101.run
-
       - name: Cache SKY130 PDK
         uses: actions/cache@v4
         with:
@@ -147,18 +144,10 @@ jobs:
 
       - name: Run OpenLane Pre-PnR Flow
         run: |
-          chmod +x .github/scripts/openlane_prepnr.sh
           docker pull "${OPENLANE_IMAGE}"
-          docker run --rm \
-            -v "$PWD":"$PWD" \
-            -w "$PWD" \
-            -e PDK_ROOT="${{ steps.pdk_path.outputs.pdk_path }}" \
-            -e PDK="${PDK}" \
-            -e SCL="${SCL}" \
-            -e DESIGN_NAME="Fp32MatrixMul" \
-            -e RTL_PATH="generated/Fp32MatrixMul.v" \
-            "${OPENLANE_IMAGE}" \
-            bash .github/scripts/openlane_prepnr.sh
+          make prepnr \
+            OPENLANE_PDK_ROOT="${{ steps.pdk_path.outputs.pdk_path }}" \
+            PREPNR_S=4
 
       - name: Export OpenLane Metrics
         id: export_metrics
