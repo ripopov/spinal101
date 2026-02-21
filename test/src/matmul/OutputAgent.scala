@@ -38,7 +38,7 @@ final case class OutputAgentConfig(
   require(clBytes > 0, "clBytes must be > 0")
 }
 
-final case class DWriteBeat(addr: BigInt, data: BigInt, cmdId: Int, last: Boolean)
+final case class DWriteBeat(addr: BigInt, data: BigInt, cmdId: Int, last: Boolean, cycle: Long)
 
 /**
  * Captures D write channel beats and applies configurable d_wr_ready backpressure.
@@ -59,6 +59,7 @@ final class OutputAgent(
   val writesByAddr: mutable.Map[BigInt, BigInt] = mutable.HashMap.empty
   val writeBeats: mutable.ArrayBuffer[DWriteBeat] = mutable.ArrayBuffer.empty
   val completedCmdIds: mutable.ArrayBuffer[Int] = mutable.ArrayBuffer.empty
+  val fireCycles: mutable.ArrayBuffer[Long] = mutable.ArrayBuffer.empty
 
   private var activeCmdId: Option[Int] = None
 
@@ -90,7 +91,8 @@ final class OutputAgent(
           }
 
           writesByAddr(addr) = data
-          writeBeats += DWriteBeat(addr, data, cmdId, last)
+          writeBeats += DWriteBeat(addr, data, cmdId, last, cycle)
+          fireCycles += cycle
 
           if (last) {
             completedCmdIds += cmdId

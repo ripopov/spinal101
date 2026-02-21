@@ -77,6 +77,9 @@ final class MemoryAgent(
   private var rspCounter = 0L
   private var heldRsp: Option[PendingRsp] = None
 
+  @volatile var maxOutstandingObserved: Int = 0
+  @volatile var lastOutstandingObserved: Int = 0
+
   def writeCacheLine(addr: BigInt, data: BigInt): Unit = {
     require(isAligned(addr), s"$name writeCacheLine unaligned address 0x${addr.toString(16)}")
     memory(addr) = data
@@ -122,6 +125,10 @@ final class MemoryAgent(
           assert(!outstandingTags.contains(tag), s"$name duplicate outstanding tag: $tag")
 
           outstandingTags += tag
+          lastOutstandingObserved = outstandingTags.size
+          if (lastOutstandingObserved > maxOutstandingObserved) {
+            maxOutstandingObserved = lastOutstandingObserved
+          }
           val latency = cfg.latencyModel.sampleCycles(rng)
           val data = memory.getOrElse(addr, BigInt(0))
           rspCounter += 1
@@ -142,6 +149,7 @@ final class MemoryAgent(
           val deliveredTag = rspTag.toBigInt.intValue
           assert(outstandingTags.contains(deliveredTag), s"$name response tag violation: unknown tag $deliveredTag")
           outstandingTags -= deliveredTag
+          lastOutstandingObserved = outstandingTags.size
           heldRsp = None
         }
 
