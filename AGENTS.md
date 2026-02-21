@@ -40,7 +40,7 @@ Repository guidance for coding agents.
 
 - Repo: `https://github.com/ripopov/spinal101`
 - Branch: `main`
-- Latest CI-focused commit: `1c6b9d5` (`Use grep-based metric extraction for OpenLane reports`)
+- Latest CI-focused commit: `6756232` (`Report critical path endpoints in OpenLane CI summary`)
 
 ### Workflow state
 
@@ -48,22 +48,34 @@ Repository guidance for coding agents.
   - `build-and-test` (Mill + Verilator tests)
   - `openlane-prepnr` (Yosys + DEF + pre-PnR STA in OpenLane container on SKY130)
   - `report` (aggregated summary)
+- OpenLane metrics exported to workflow outputs:
+  - `gate_count`
+  - `worst_slack_ns`
+  - `critical_path_ns`
+  - `critical_path_delay_ns`
+  - `critical_startpoint`
+  - `critical_endpoint`
+  - `max_frequency_mhz`
 
 ### Last known GitHub Actions results
 
-- Failed: run `22252338545` on commit `1c6b9d5`
-  - Job: `openlane-prepnr`
-  - Step: `Run OpenLane Pre-PnR Flow`
-  - Error: `.github/scripts/openlane_prepnr.sh: line 99: awk: command not found`
-  - Exit code: `127`
-- Last fully green run: `22252293910` on commit `db7dde3`
-  - Note: jobs passed, but summary metrics were still `n/a` (parsing issue).
+- Latest run: `22253055097` on commit `6756232` - `success`
+  - Jobs: `build-and-test`, `openlane-prepnr`, `report` all green.
+  - OpenLane metrics:
+    - Gate count: `6620`
+    - Worst slack: `-34.73 ns`
+    - Critical path estimate: `44.7300 ns`
+    - Critical path delay (`report_checks`): `44.5466 ns`
+    - Critical path startpoint: `_21215_ (rising edge-triggered flip-flop clocked by core_clk)`
+    - Critical path endpoint: `_21138_ (rising edge-triggered flip-flop clocked by core_clk)`
+    - Max frequency estimate: `22.356 MHz`
+- Previous run: `22252963847` on commit `f2f8d09` - `success`
+  - Metrics present for gate/slack/frequency; critical path endpoint fields were added in `6756232`.
 
 ### Debug handoff for next session
 
-- Primary file to fix: `.github/scripts/openlane_prepnr.sh`
-- Likely next change: replace `awk`-dependent metric parsing with tooling guaranteed in container (portable `sed` or `python3`).
-- After fix: push to `main`, then verify run `CI` has all jobs green and exports:
-  - test status
-  - gate count
-  - worst slack / max frequency
+- Primary status: CI pipeline is stable and exporting complete OpenLane pre-PnR metrics, including critical path endpoints.
+- Optimization starting point:
+  - Startpoint net/register: `_21215_`
+  - Endpoint net/register: `_21138_`
+  - Inspect path in `build/openlane_prepnr/opensta_checks.rpt` and corresponding logic in `build/openlane_prepnr/Fp32MatrixMul_synth.v`.
