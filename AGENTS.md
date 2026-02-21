@@ -9,8 +9,32 @@ Repository guidance for coding agents.
 - Build system: Mill 0.12.17
 - Main module: `spinal101`
 
+## Staged Implementation Plan
+
+The project follows `STAGED_PLAN.md` — a staged build-up of a systolic FP32 matrix multiplier
+defined by `SPEC.md`.
+
+### "Implement next stage" protocol
+
+When the user says **"implement next stage"** (or "next step", "next stage"), do the following:
+
+1. **Read `STAGED_PLAN.md`** and find the first unchecked stage (`- [ ]`).
+2. **Implement all work items** listed under that stage. Follow the exit criteria exactly.
+3. **Run `mill spinal101.test`** — all tests must pass.
+4. **Run `mill spinal101.compile`** — must succeed.
+5. **If the stage requires RTL generation**, run the appropriate `make rtl` / `make rtl-systolic`
+   target and verify it produces Verilog without errors.
+6. **Update `STAGED_PLAN.md`**: change the completed stage's checkbox from `- [ ]` to `- [x]`.
+7. **Commit all changes** (source, tests, and updated plan) with a descriptive message.
+8. **Do not push** unless the user explicitly asks.
+
+If a stage fails its exit criteria, fix the issue before marking it complete. Never check a box
+for a stage that does not pass its tests.
+
 ## Key Paths
 
+- `SPEC.md` - architecture specification (v1.1-draft)
+- `STAGED_PLAN.md` - staged implementation plan with progress checkboxes
 - `build.mill` - build and dependency setup
 - `src/matmul/Fp32Math.scala` - FP32 add/mul datapath logic
 - `src/matmul/Fp32MatrixMul.scala` - parameterized matrix multiplier component
@@ -21,8 +45,10 @@ Repository guidance for coding agents.
 ## Common Commands
 
 - Run tests: `mill spinal101.test`
+- Compile only: `mill spinal101.compile`
 - Generate RTL (default 2x2): `mill spinal101.run`
 - Generate RTL (example 3x3): `mill spinal101.run 3`
+- Full flow (test + rtl + synthesis + report): `make flow`
 
 ## Verification Expectations
 
@@ -35,6 +61,7 @@ Repository guidance for coding agents.
 - Avoid global hardware `val` definitions that can leak across elaborations; prefer methods for hardware literals/constants.
 - Build artifacts are ignored (`out/`, `generated/`, `simWorkspace/`).
 - Icarus backend is not enabled in tests in this environment; Verilator is the supported path.
+- Parameterize `S` in all new RTL modules (default 16, test with 4 for fast simulation).
 
 ## Current CI / OpenLane Status (2026-02-21 UTC)
 
@@ -69,13 +96,3 @@ Repository guidance for coding agents.
     - Critical path startpoint: `_21215_ (rising edge-triggered flip-flop clocked by core_clk)`
     - Critical path endpoint: `_21138_ (rising edge-triggered flip-flop clocked by core_clk)`
     - Max frequency estimate: `22.356 MHz`
-- Previous run: `22252963847` on commit `f2f8d09` - `success`
-  - Metrics present for gate/slack/frequency; critical path endpoint fields were added in `6756232`.
-
-### Debug handoff for next session
-
-- Primary status: CI pipeline is stable and exporting complete OpenLane pre-PnR metrics, including critical path endpoints.
-- Optimization starting point:
-  - Startpoint net/register: `_21215_`
-  - Endpoint net/register: `_21138_`
-  - Inspect path in `build/openlane_prepnr/opensta_checks.rpt` and corresponding logic in `build/openlane_prepnr/Fp32MatrixMul_synth.v`.
