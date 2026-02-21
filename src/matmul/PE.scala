@@ -64,29 +64,39 @@ case class PE(lMul: Int = 4, lAdd: Int = 4) extends Component {
     pipe
   }
 
-  when(io.clear) {
-    when(io.bank_sel) {
-      bank1 := B(0, 32 bits)
-      bank1Shadow := B(0, 32 bits)
-    } otherwise {
-      bank0 := B(0, 32 bits)
-      bank0Shadow := B(0, 32 bits)
-    }
-  } otherwise {
-    // Speculative running sum used for throughput-1 accumulation.
-    when(mulPipe.io.validOut) {
-      when(bankSelMul) {
+  val clearBank1 = io.clear && io.bank_sel
+  val clearBank0 = io.clear && !io.bank_sel
+
+  when(clearBank1) {
+    bank1 := B(0, 32 bits)
+    bank1Shadow := B(0, 32 bits)
+  }
+  when(clearBank0) {
+    bank0 := B(0, 32 bits)
+    bank0Shadow := B(0, 32 bits)
+  }
+
+  // Speculative running sum used for throughput-1 accumulation.
+  when(mulPipe.io.validOut) {
+    when(bankSelMul) {
+      when(!clearBank1) {
         bank1Shadow := Fp32Math.add(bank1Shadow, mulPipe.io.result)
-      } otherwise {
+      }
+    } otherwise {
+      when(!clearBank0) {
         bank0Shadow := Fp32Math.add(bank0Shadow, mulPipe.io.result)
       }
     }
+  }
 
-    // Committed/drain-visible bank value follows pipelined adder output.
-    when(addPipe.io.validOut) {
-      when(bankSelAdd) {
+  // Committed/drain-visible bank value follows pipelined adder output.
+  when(addPipe.io.validOut) {
+    when(bankSelAdd) {
+      when(!clearBank1) {
         bank1 := addPipe.io.result
-      } otherwise {
+      }
+    } otherwise {
+      when(!clearBank0) {
         bank0 := addPipe.io.result
       }
     }

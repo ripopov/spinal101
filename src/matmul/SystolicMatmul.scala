@@ -193,15 +193,17 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val injectQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
   val injectBankQ = StreamFifo(Bool(), ctrlFifoDepth)
   val drainQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
+  val drainDelayW = log2Up(2 * (cfg.s - 1) + cfg.lMul + cfg.lAdd + 2)
+  val drainDelayQ = StreamFifo(UInt(drainDelayW bits), ctrlFifoDepth)
 
   object PrefetchState extends SpinalEnum {
     val IDLE, START_READS, LOAD_AB, ENQ_INJECT, ERROR_DRAIN, ERROR_STATUS = newElement()
   }
   object InjectState extends SpinalEnum {
-    val IDLE, SWAP_TB, FEED, TAIL, ENQ_DRAIN = newElement()
+    val IDLE, FEED, ENQ_DRAIN = newElement()
   }
   object DrainState extends SpinalEnum {
-    val IDLE, DRAIN_START, DRAIN_WAIT, FLUSH_START, FLUSH_WAIT, STEP_DONE = newElement()
+    val IDLE, LOAD_PENDING, WAIT_DELAY, DRAIN_REQ, DRAIN_WAIT, FLUSH_REQ, FLUSH_WAIT = newElement()
   }
 
   val prefetchState = RegInit(PrefetchState.IDLE)
@@ -212,6 +214,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val prefetchCtx = Reg(StepCtx(cfg))
   val injectCtx = Reg(StepCtx(cfg))
   val drainCtx = Reg(StepCtx(cfg))
+  val drainPendingValid = Reg(Bool()) init (False)
+  val drainPendingCtx = Reg(StepCtx(cfg))
+  val drainPendingDelay = Reg(UInt(drainDelayW bits)) init (0)
   val prefetchStageBank = Reg(Bool()) init (False)
   val injectStageBank = Reg(Bool()) init (False)
   val nextPrefetchBank = Reg(Bool()) init (False)
@@ -227,8 +232,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val bLoadCnt = Reg(UInt(log2Up(cfg.s + 1) bits)) init (0)
   val feedCnt = Reg(UInt(log2Up(cfg.s) bits)) init (0)
   val tailTotal = 2 * (cfg.s - 1) + cfg.lMul + cfg.lAdd
-  val tailCnt = Reg(UInt(log2Up(tailTotal + 1) bits)) init (0)
-  val tailTarget = U(tailTotal - 1, log2Up(tailTotal + 1) bits)
+  val drainTailDelay = U(tailTotal + 1, drainDelayW bits)
 
   // Explicit hazard scoreboard for compute/drain bank conflicts.
   val bank0ComputeBusy = Reg(Bool()) init (False)
@@ -346,6 +350,10 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   drainQ.io.push.payload := injectCtx
   drainQ.io.pop.ready := False
 
+  drainDelayQ.io.push.valid := False
+  drainDelayQ.io.push.payload := drainTailDelay
+  drainDelayQ.io.pop.ready := False
+
   // TileScheduler
   tileScheduler.io.cmdValid := False
   tileScheduler.io.cmdDesc := schedCmdCtx.cmdDesc
@@ -385,8 +393,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   systolicCore.io.clearBank := False
 
   // DrainPacker defaults
-  drainPacker.io.drainStart := False
-  drainPacker.io.flushStart := False
+  drainPacker.io.drainReqValid := False
+  drainPacker.io.flushReqValid := False
   drainPacker.io.drainBankIn := False
   drainPacker.io.pi := 0
   drainPacker.io.pj := 0
@@ -483,6 +491,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       !injectQ.io.pop.valid &&
       !injectBankQ.io.pop.valid &&
       !drainQ.io.pop.valid &&
+      !drainDelayQ.io.pop.valid &&
+      !drainPendingValid &&
       !stageBankValid0 &&
       !stageBankValid1 &&
       !readEngineA.io.busy &&
@@ -629,6 +639,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       bank1RowBusy := 0
       stageBankValid0 := False
       stageBankValid1 := False
+      drainPendingValid := False
       injectState := InjectState.IDLE
       drainState := DrainState.IDLE
       prefetchState := PrefetchState.IDLE
@@ -637,13 +648,26 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   // ---------- Inject engine + hazard scoreboard ----------
 
+  val enableDrainOverlap = cfg.s <= 8
   val bankHazardForInject = Bool()
   bankHazardForInject := False
-  when(injectQ.io.pop.valid) {
-    when(injectQ.io.pop.payload.bankSel) {
-      bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
-    } otherwise {
-      bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
+  if (enableDrainOverlap) {
+    when(injectQ.io.pop.valid) {
+      when(injectQ.io.pop.payload.bankSel) {
+        bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
+      } otherwise {
+        bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
+      }
+    }
+  } else {
+    when(bank0DrainBusy || bank1DrainBusy) {
+      bankHazardForInject := True
+    } elsewhen (injectQ.io.pop.valid) {
+      when(injectQ.io.pop.payload.bankSel) {
+        bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
+      } otherwise {
+        bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
+      }
     }
   }
 
@@ -681,12 +705,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       }
     }
 
-    is(InjectState.SWAP_TB) {
-      traceFeedStart := True
-      feedCnt := 0
-      injectState := InjectState.FEED
-    }
-
     is(InjectState.FEED) {
       for (i <- 0 until cfg.s) {
         systolicCore.io.aIn(i) := aFeedCol(i)
@@ -705,8 +723,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
           stageBankValid0 := False
         }
         when(injectCtx.drainTrigger) {
-          tailCnt := 0
-          injectState := InjectState.TAIL
+          injectState := InjectState.ENQ_DRAIN
         } otherwise {
           when(injectCtx.bankSel) {
             bank1ComputeBusy := False
@@ -720,22 +737,13 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       }
     }
 
-    is(InjectState.TAIL) {
-      if (cfg.s > 1) {
-        when(tailCnt === tailTarget) {
-          injectState := InjectState.ENQ_DRAIN
-        } otherwise {
-          tailCnt := tailCnt + 1
-        }
-      } else {
-        injectState := InjectState.ENQ_DRAIN
-      }
-    }
-
     is(InjectState.ENQ_DRAIN) {
-      drainQ.io.push.valid := True
+      val canEnqueueDrain = drainQ.io.push.ready && drainDelayQ.io.push.ready
+      drainQ.io.push.valid := canEnqueueDrain
       drainQ.io.push.payload := injectCtx
-      when(drainQ.io.push.ready) {
+      drainDelayQ.io.push.valid := canEnqueueDrain
+      drainDelayQ.io.push.payload := drainTailDelay
+      when(canEnqueueDrain) {
         when(injectCtx.bankSel) {
           bank1ComputeBusy := False
           bank1DrainBusy := True
@@ -770,54 +778,91 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   switch(drainState) {
     is(DrainState.IDLE) {
       when(schedAbort) {
-        drainQ.io.pop.ready := drainQ.io.pop.valid
-      } elsewhen(drainQ.io.pop.valid) {
-        drainQ.io.pop.ready := True
-        drainCtx := drainQ.io.pop.payload
-        drainState := DrainState.DRAIN_START
+        val canDropDrain = drainQ.io.pop.valid && drainDelayQ.io.pop.valid
+        drainQ.io.pop.ready := canDropDrain
+        drainDelayQ.io.pop.ready := canDropDrain
+        drainPendingValid := False
+      } elsewhen(drainPendingValid || (drainQ.io.pop.valid && drainDelayQ.io.pop.valid)) {
+        drainState := DrainState.LOAD_PENDING
       }
     }
 
-    is(DrainState.DRAIN_START) {
-      traceDrainStart := True
-      drainPacker.io.drainStart := True
-      drainState := DrainState.DRAIN_WAIT
+    is(DrainState.LOAD_PENDING) {
+      when(schedAbort) {
+        val canDropDrain = drainQ.io.pop.valid && drainDelayQ.io.pop.valid
+        drainQ.io.pop.ready := canDropDrain
+        drainDelayQ.io.pop.ready := canDropDrain
+        drainPendingValid := False
+        drainState := DrainState.IDLE
+      } elsewhen(!drainPendingValid) {
+        val canPopDrain = drainQ.io.pop.valid && drainDelayQ.io.pop.valid
+        drainQ.io.pop.ready := canPopDrain
+        drainDelayQ.io.pop.ready := canPopDrain
+        when(canPopDrain) {
+          drainPendingCtx := drainQ.io.pop.payload
+          drainPendingDelay := drainDelayQ.io.pop.payload
+          drainPendingValid := True
+        } otherwise {
+          drainState := DrainState.IDLE
+        }
+      } otherwise {
+        drainState := DrainState.WAIT_DELAY
+      }
+    }
+
+    is(DrainState.WAIT_DELAY) {
+      when(!drainPendingValid) {
+        drainState := DrainState.IDLE
+      } elsewhen(drainPendingDelay === 0) {
+        drainCtx := drainPendingCtx
+        drainPendingValid := False
+        drainState := DrainState.DRAIN_REQ
+      } otherwise {
+        drainPendingDelay := drainPendingDelay - 1
+      }
+    }
+
+    is(DrainState.DRAIN_REQ) {
+      drainPacker.io.drainReqValid := True
+      when(drainPacker.io.drainReqReady) {
+        traceDrainStart := True
+        drainState := DrainState.DRAIN_WAIT
+      }
     }
 
     is(DrainState.DRAIN_WAIT) {
       when(drainPacker.io.drainDone) {
         traceDrainDone := True
+        when(drainCtx.bankSel) {
+          bank1DrainBusy := False
+          bank1RowBusy := 0
+        } otherwise {
+          bank0DrainBusy := False
+          bank0RowBusy := 0
+        }
         val lastMiNj = (drainCtx.mi === drainCtx.numMi - 1) && (drainCtx.nj === drainCtx.numNj - 1)
         val lastPkCmd = drainCtx.pkCmd === drainCtx.numPkCmd - 1
         when(lastMiNj && lastPkCmd) {
-          drainState := DrainState.FLUSH_START
+          drainState := DrainState.FLUSH_REQ
         } otherwise {
-          drainState := DrainState.STEP_DONE
+          drainState := DrainState.IDLE
         }
       }
     }
 
-    is(DrainState.FLUSH_START) {
-      drainPacker.io.flushStart := True
-      drainState := DrainState.FLUSH_WAIT
+    is(DrainState.FLUSH_REQ) {
+      drainPacker.io.flushReqValid := True
+      when(drainPacker.io.flushReqReady) {
+        drainState := DrainState.FLUSH_WAIT
+      }
     }
 
     is(DrainState.FLUSH_WAIT) {
       when(drainPacker.io.flushDone) {
-        drainState := DrainState.STEP_DONE
+        drainState := DrainState.IDLE
       }
     }
 
-    is(DrainState.STEP_DONE) {
-      when(drainCtx.bankSel) {
-        bank1DrainBusy := False
-        bank1RowBusy := 0
-      } otherwise {
-        bank0DrainBusy := False
-        bank0RowBusy := 0
-      }
-      drainState := DrainState.IDLE
-    }
   }
 
   // ---------- Utilization/Trace Counter Updates ----------
@@ -841,11 +886,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       (prefetchState === PrefetchState.ERROR_STATUS) ||
       schedAbort
   val stallOutputBackpressureCond =
-    (drainState === DrainState.DRAIN_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
+    (drainState === DrainState.FLUSH_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
   val stallDrainBlockedCond =
-    (injectState === InjectState.TAIL) ||
-      (drainState === DrainState.DRAIN_START) ||
-      ((drainState === DrainState.DRAIN_WAIT) && !drainPacker.io.drainDone && !stallOutputBackpressureCond)
+    (injectState === InjectState.ENQ_DRAIN) && !(drainQ.io.push.ready && drainDelayQ.io.push.ready)
   val stallBankHazardCond = bankHazardForInject
   val stallANotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && !aLoadDone
   val stallBNotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && aLoadDone && !bLoadDone
@@ -898,6 +941,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       !injectQ.io.pop.valid &&
       !injectBankQ.io.pop.valid &&
       !drainQ.io.pop.valid &&
+      !drainDelayQ.io.pop.valid &&
+      !drainPendingValid &&
       !stageBankValid0 &&
       !stageBankValid1 &&
       !readEngineA.io.busy &&

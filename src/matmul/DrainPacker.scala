@@ -8,7 +8,8 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   val dBufIdxW: Int = log2Up(maxDBufferCls)
 
   val io = new Bundle {
-    val drainStart = in Bool()
+    val drainReqValid = in Bool()
+    val drainReqReady = out Bool()
     val drainDone = out Bool()
 
     val pi = in UInt(16 bits)
@@ -29,7 +30,8 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
     val drainRow = out UInt(log2Up(cfg.s) bits)
     val drainData = in Vec(Bits(32 bits), cfg.s)
 
-    val flushStart = in Bool()
+    val flushReqValid = in Bool()
+    val flushReqReady = out Bool()
     val flushDone = out Bool()
 
     val outValid = out Bool()
@@ -51,6 +53,20 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
 
   val rowCnt = Reg(UInt(log2Up(cfg.s) bits)) init (0)
   val packedCl = Reg(Bits(cfg.clBits bits)) init (0)
+
+  // Request context is captured on enqueue to decouple controller timing.
+  val reqPi = Reg(UInt(16 bits)) init (0)
+  val reqPj = Reg(UInt(16 bits)) init (0)
+  val reqPkCmd = Reg(UInt(16 bits)) init (0)
+  val reqMi = Reg(UInt(16 bits)) init (0)
+  val reqNj = Reg(UInt(16 bits)) init (0)
+  val reqNumPkCmd = Reg(UInt(16 bits)) init (0)
+  val reqNumMi = Reg(UInt(16 bits)) init (0)
+  val reqNumNj = Reg(UInt(16 bits)) init (0)
+  val reqNumPi = Reg(UInt(16 bits)) init (0)
+  val reqNumPj = Reg(UInt(16 bits)) init (0)
+  val reqCmdDesc = Reg(CmdDesc(cfg))
+  val reqDrainBank = Reg(Bool()) init (False)
 
   val bufMi = Reg(UInt(16 bits)) init (0)
   val bufNj = Reg(UInt(16 bits)) init (0)
@@ -80,13 +96,15 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   io.drainDone := False
   io.flushDone := False
   io.cmdDone := False
-  io.drainBank := io.drainBankIn
+  io.drainReqReady := state === S.IDLE
+  io.flushReqReady := state === S.IDLE && !io.drainReqValid
+  io.drainBank := reqDrainBank
   io.drainRow := rowCnt
   io.outValid := False
   io.outAddr := 0
   io.outData := 0
   io.outLast := False
-  io.outCmdId := io.cmdDesc.cmdId
+  io.outCmdId := reqCmdDesc.cmdId
 
   // Write port
   val wrEn = Bool()
@@ -98,7 +116,7 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   dBuffer.write(wrAddr, wrData, wrEn)
 
   def computeBufIdx(mi: UInt, nj: UInt, row: UInt): UInt = {
-    ((mi * io.numNj + nj) * U(cfg.s, 16 bits) + row.resize(16)).resize(dBufIdxW)
+    ((mi * reqNumNj + nj) * U(cfg.s, 16 bits) + row.resize(16)).resize(dBufIdxW)
   }
 
   def packDrainData(): Bits = {
@@ -122,35 +140,59 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   }
 
   def computeFlushAddr(mi: UInt, nj: UInt, row: UInt): UInt = {
-    val globalM = (io.pi.resize(cfg.addrBits) * io.cmdDesc.primM.resize(cfg.addrBits) +
+    val globalM = (reqPi.resize(cfg.addrBits) * reqCmdDesc.primM.resize(cfg.addrBits) +
       mi.resize(cfg.addrBits) * U(cfg.s, cfg.addrBits bits) +
       row.resize(cfg.addrBits)).resize(cfg.addrBits)
-    val globalN = (io.pj.resize(cfg.addrBits) * io.cmdDesc.primN.resize(cfg.addrBits) +
+    val globalN = (reqPj.resize(cfg.addrBits) * reqCmdDesc.primN.resize(cfg.addrBits) +
       nj.resize(cfg.addrBits) * U(cfg.s, cfg.addrBits bits)).resize(cfg.addrBits)
-    val offset = (globalM * io.cmdDesc.ldd.resize(cfg.addrBits) + globalN).resize(cfg.addrBits)
-    (io.cmdDesc.dBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
+    val offset = (globalM * reqCmdDesc.ldd.resize(cfg.addrBits) + globalN).resize(cfg.addrBits)
+    (reqCmdDesc.dBase + offset * U(4, cfg.addrBits bits)).resize(cfg.addrBits)
   }
 
   def isLastFlush(): Bool = {
-    val lastMi = flushMi === (io.numMi - 1)
-    val lastNj = flushNj === (io.numNj - 1)
+    val lastMi = flushMi === (reqNumMi - 1)
+    val lastNj = flushNj === (reqNumNj - 1)
     val lastRow = flushRow === U(cfg.s - 1, flushRow.getWidth bits)
     lastMi && lastNj && lastRow
   }
 
   def isLastCmd(): Bool = {
-    isLastFlush() && (io.pi === (io.numPi - 1)) && (io.pj === (io.numPj - 1))
+    isLastFlush() && (reqPi === (reqNumPi - 1)) && (reqPj === (reqNumPj - 1))
   }
 
   switch(state) {
     is(S.IDLE) {
-      when(io.flushStart) {
+      when(io.flushReqValid && io.flushReqReady) {
+        reqPi := io.pi
+        reqPj := io.pj
+        reqPkCmd := io.pkCmd
+        reqMi := io.mi
+        reqNj := io.nj
+        reqNumPkCmd := io.numPkCmd
+        reqNumMi := io.numMi
+        reqNumNj := io.numNj
+        reqNumPi := io.numPi
+        reqNumPj := io.numPj
+        reqCmdDesc := io.cmdDesc
+        reqDrainBank := io.drainBankIn
         flushMi := 0
         flushNj := 0
         flushRow := 0
         flushIdx := 0
         state := S.FLUSH_READ
-      } elsewhen(io.drainStart) {
+      } elsewhen(io.drainReqValid && io.drainReqReady) {
+        reqPi := io.pi
+        reqPj := io.pj
+        reqPkCmd := io.pkCmd
+        reqMi := io.mi
+        reqNj := io.nj
+        reqNumPkCmd := io.numPkCmd
+        reqNumMi := io.numMi
+        reqNumNj := io.numNj
+        reqNumPi := io.numPi
+        reqNumPj := io.numPj
+        reqCmdDesc := io.cmdDesc
+        reqDrainBank := io.drainBankIn
         rowCnt := 0
         bufMi := io.mi
         bufNj := io.nj
@@ -161,7 +203,7 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
     is(S.DRAIN_READ) {
       packedCl := packDrainData()
       bufIdx := computeBufIdx(bufMi, bufNj, rowCnt.resize(16))
-      when(io.pkCmd === 0) {
+      when(reqPkCmd === 0) {
         state := S.DRAIN_PACK
       } otherwise {
         state := S.DRAIN_RMW_READ
@@ -215,7 +257,7 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
       io.outAddr := flushOutAddr
       io.outData := rdData
       io.outLast := flushOutLast
-      io.outCmdId := io.cmdDesc.cmdId
+      io.outCmdId := reqCmdDesc.cmdId
 
       when(io.outReady) {
         when(flushOutIsLastFlush) {
@@ -230,7 +272,7 @@ case class DrainPacker(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
             flushIdx := flushIdx + 1
           } otherwise {
             flushRow := 0
-            when(flushNj + 1 < io.numNj) {
+            when(flushNj + 1 < reqNumNj) {
               flushNj := flushNj + 1
               flushIdx := flushIdx + 1
             } otherwise {

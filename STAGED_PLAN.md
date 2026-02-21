@@ -17,7 +17,7 @@
 - [x] **Stage 9** — Controller utilization instrumentation and baseline
 - [x] **Stage 10** — Controller decomposition into pipelined engines
 - [x] **Stage 11** — Zero-bubble A/B supply pipeline
-- [ ] **Stage 12** — Drain/compute overlap with bank rotation
+- [x] **Stage 12** — Drain/compute overlap with bank rotation
 - [ ] **Stage 13** — Multi-command pipelining and in-order commit
 - [ ] **Stage 14** — Utilization closure and CI gating
 

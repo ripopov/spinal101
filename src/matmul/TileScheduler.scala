@@ -33,6 +33,8 @@ case class TileScheduler(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ext
   val mi = Reg(UInt(16 bits)) init (0)
   val nj = Reg(UInt(16 bits)) init (0)
   val pk = Reg(UInt(16 bits)) init (0)
+  // Explicit bank rotation: one bank epoch per drained micro-tile.
+  val bankEpoch = Reg(Bool()) init (False)
 
   val numPi = UInt(16 bits)
   val numPj = UInt(16 bits)
@@ -58,6 +60,7 @@ case class TileScheduler(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ext
     mi := 0
     nj := 0
     pk := 0
+    bankEpoch := False
   }
 
   io.stepValid := active
@@ -70,9 +73,12 @@ case class TileScheduler(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ext
 
   io.clearBank := pk === 0
   io.drainTrigger := pk === (numPk - 1)
-  io.bankSel := (mi + nj)(0)
+  io.bankSel := bankEpoch
 
   when(active && io.stepReady) {
+    when(pk === (numPk - 1)) {
+      bankEpoch := !bankEpoch
+    }
     when(pk + 1 < numPk) {
       pk := pk + 1
     } otherwise {

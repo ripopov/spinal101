@@ -125,14 +125,14 @@ class UtilizationSpec extends AnyFunSuite {
           aBase = aBase,
           bBase = bBase,
           dBase = dBase,
-          m = 4 * s,
-          n = 4 * s,
+          m = 2 * s,
+          n = 2 * s,
           k = s,
           lda = s,
-          ldb = 4 * s,
-          ldd = 4 * s,
-          primM = 2 * s,
-          primN = 2 * s,
+          ldb = 2 * s,
+          ldd = 2 * s,
+          primM = s,
+          primN = s,
           primK = s
         )
       }
@@ -184,6 +184,7 @@ class UtilizationSpec extends AnyFunSuite {
       assert(metrics.traceCmdAcceptedCount == cmdCount, s"accepted command count mismatch for $tag")
       assert(metrics.traceFeedStartCount > 0, s"no feed-start trace events for $tag")
       assert(metrics.traceDrainStartCount == metrics.traceDrainDoneCount, s"drain start/done mismatch for $tag")
+      assert(metrics.stallDrainBlockedCycles == 0, s"drain_blocked must be zero in no-backpressure baseline for $tag")
       assert(
         metrics.injectFullCycles + metrics.stallSum <= (metrics.injectWindowCycles + 1),
         s"stall + full cycles exceed window for $tag"
