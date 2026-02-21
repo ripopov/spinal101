@@ -2,7 +2,7 @@ package matmul
 
 import spinal.core._
 
-case class Fp32MatrixMulIO(size: Int) extends Bundle {
+case class Fp32MatrixMulV0IO(size: Int) extends Bundle {
   val start = in Bool()
   val busy = out Bool()
   val done = out Bool()
@@ -11,13 +11,13 @@ case class Fp32MatrixMulIO(size: Int) extends Bundle {
   val c = out Vec (Vec(Bits(32 bits), size), size)
 }
 
-case class Fp32MatrixMul(size: Int = 2) extends Component {
+case class Fp32MatrixMulV0(size: Int = 2) extends Component {
   require(size >= 2, "size must be >= 2")
 
   private val indexWidth = log2Up(size)
   private val flatIndexWidth = log2Up(size * size)
 
-  val io = new Fp32MatrixMulIO(size)
+  val io = new Fp32MatrixMulV0IO(size)
 
   val aReg = Vec(Reg(Bits(32 bits)) init (0), size * size)
   val bReg = Vec(Reg(Bits(32 bits)) init (0), size * size)

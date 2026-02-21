@@ -5,7 +5,7 @@ import spinal.core.sim._
 
 import scala.util.Random
 
-class Fp32MatrixMulSimSpec extends AnyFunSuite {
+class Fp32MatrixMulV0SimSpec extends AnyFunSuite {
   private val size = 2
   private val random = new Random(0xF32)
 
@@ -44,7 +44,7 @@ class Fp32MatrixMulSimSpec extends AnyFunSuite {
   }
 
   private def runCase(
-      dut: Fp32MatrixMul,
+      dut: Fp32MatrixMulV0,
       a: Vector[Vector[Float]],
       b: Vector[Vector[Float]],
       label: String
@@ -80,7 +80,7 @@ class Fp32MatrixMulSimSpec extends AnyFunSuite {
   }
 
   private def runBackend(name: String, config: SpinalSimConfig): Unit = {
-    config.compile(new Fp32MatrixMul(size)).doSim(name) { dut: Fp32MatrixMul =>
+    config.compile(new Fp32MatrixMulV0(size)).doSim(name) { dut: Fp32MatrixMulV0 =>
       dut.clockDomain.forkStimulus(2)
       dut.io.start #= false
 

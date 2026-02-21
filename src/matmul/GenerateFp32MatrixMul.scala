@@ -7,6 +7,6 @@ object GenerateFp32MatrixMul {
     val size = if (args.nonEmpty) args(0).toInt else 2
 
     SpinalConfig(targetDirectory = "generated")
-      .generateVerilog(Fp32MatrixMul(size = size))
+      .generateVerilog(Fp32MatrixMulV0(size = size))
   }
 }

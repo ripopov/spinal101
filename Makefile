@@ -12,19 +12,20 @@ PDK_FAMILY ?= sky130
 PDK_ROOT_CACHE ?= ./.volare-sky130
 OPENLANE_PDK_ROOT ?=
 
-DESIGN_NAME ?= Fp32MatrixMul
-RTL_PATH ?= generated/Fp32MatrixMul.v
+DESIGN_NAME ?= SystolicMatmul
+RTL_PATH ?= generated/SystolicMatmul.v
 WORK_DIR ?= build/openlane_prepnr
 
 CLOCK_PORT ?= clk
 TARGET_PERIOD_NS ?= 10.0
 
-.PHONY: help build test rtl prepnr report flow clean-prepnr
+.PHONY: help build test rtl rtl-systolic prepnr report flow clean-prepnr
 
 help:
 	@echo "Targets:"
 	@echo "  make test         - Run Scala/Verilator testbench"
-	@echo "  make rtl          - Generate RTL (default 2x2)"
+	@echo "  make rtl          - Generate V0 RTL (default 2x2)"
+	@echo "  make rtl-systolic - Generate SystolicMatmul RTL"
 	@echo "  make prepnr       - Run OpenLane pre-PnR synthesis/STA flow"
 	@echo "  make report       - Print timing/gate-count summary"
 	@echo "  make flow         - End-to-end: test + rtl + prepnr + report"
@@ -44,7 +45,10 @@ test:
 rtl:
 	$(MILL) $(MILL_NO_SERVER) spinal101.run
 
-prepnr: rtl
+rtl-systolic:
+	$(MILL) $(MILL_NO_SERVER) spinal101.runMain matmul.GenerateSystolicMatmul
+
+prepnr: rtl-systolic
 	@pdk_path="$(OPENLANE_PDK_ROOT)"; \
 	if [[ -z "$$pdk_path" ]]; then \
 		pdk_path="$$(python3 -m volare path --pdk $(PDK_FAMILY) --pdk-root $(PDK_ROOT_CACHE) $(OPEN_PDKS_REV))"; \
