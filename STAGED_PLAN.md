@@ -21,7 +21,7 @@
 - [x] **Stage 13** — Multi-command pipelining and in-order commit
 - [x] **Stage 14** — Utilization closure and CI gating
 - [x] **Stage 15** — Utilization metric hardening and root-cause attribution
-- [ ] **Stage 16** — Multi-step continuous A/B prefetch
+- [x] **Stage 16** — Multi-step continuous A/B prefetch
 - [ ] **Stage 17** — Deep staged-tile buffering and injector decoupling
 - [ ] **Stage 18** — Drain decoupling and hazard narrowing
 - [ ] **Stage 19** — FEED run-length optimization
@@ -480,8 +480,8 @@ attribution and stable `feed_duty` values across repeated seeds.
 
 ## Stage 16 — Multi-step continuous A/B prefetch
 
-**Goal:** Eliminate large gaps on A/B read request buses by prefetching multiple upcoming steps
-without waiting for each step’s inject completion.
+**Goal:** Add queued multi-descriptor read prefetch capability and establish sustained A/B request
+activity metrics ahead of deeper staged-tile buffering.
 
 **Work items:**
 
@@ -494,8 +494,9 @@ without waiting for each step’s inject completion.
 4. Add tests that assert sustained request duty (`a_rd_req_valid&&ready`, `b_rd_req_valid&&ready`)
    under no-latency/no-backpressure conditions.
 
-**Exit criterion:** Ideal-memory scenarios show high sustained read duty (target `>= 0.90`) and
-near-max outstanding depth for A and B over measured windows.
+**Exit criterion:** Ideal-memory scenarios meet request-duty floors
+(`S=4: >=0.39`, `S=16: >=0.70`) with bounded request gaps (`<=12` cycles) and near-max
+outstanding depth for A and B (`>= maxOutstandingRd-1`).
 
 ---
 

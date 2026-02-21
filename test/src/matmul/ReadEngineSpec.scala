@@ -68,10 +68,10 @@ class ReadEngineSpec extends AnyFunSuite {
       }
   }
 
-  test("ReadEngine accepts a queued descriptor while current transfer is active") {
-    SpinalSimConfig().withVerilator.compile(ReadEngine(addrBits = 64, clBits = 128, maxOutstandingRd = 4)).doSim(
-      "read_engine_queued"
-    ) { dut =>
+  test("ReadEngine accepts multiple queued descriptors and chains request issue with bounded gaps") {
+    SpinalSimConfig().withVerilator.compile(
+      ReadEngine(addrBits = 64, clBits = 128, maxOutstandingRd = 4, descriptorQueueDepth = 8)
+    ).doSim("read_engine_queued") { dut =>
       dut.clockDomain.forkStimulus(2)
 
       dut.io.start #= false
@@ -87,16 +87,20 @@ class ReadEngineSpec extends AnyFunSuite {
       dut.io.outReady #= true
 
       val reqAddrs = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      val reqCycles = scala.collection.mutable.ArrayBuffer.empty[Int]
       val outData = scala.collection.mutable.ArrayBuffer.empty[BigInt]
       val rspQ = scala.collection.mutable.Queue.empty[(Int, BigInt)]
       var nextData = 1
+      var cycle = 0
 
       fork {
         while (true) {
           dut.clockDomain.waitSampling()
+          cycle += 1
 
           if (dut.io.rdReqValid.toBoolean && dut.io.rdReqReady.toBoolean) {
             reqAddrs += dut.io.rdReqAddr.toBigInt
+            reqCycles += cycle
             rspQ.enqueue((dut.io.rdReqTag.toBigInt.intValue, BigInt(nextData)))
             nextData += 1
           }
@@ -117,31 +121,46 @@ class ReadEngineSpec extends AnyFunSuite {
         }
       }
 
-      dut.io.cfgBase #= BigInt(0x1000)
-      dut.io.cfgStride #= 16
-      dut.io.cfgCount #= 2
-      dut.io.start #= true
-      dut.clockDomain.waitSampling()
-      dut.io.start #= false
+      val descs = Seq(
+        (BigInt(0x1000), 2),
+        (BigInt(0x2000), 2),
+        (BigInt(0x3000), 2),
+        (BigInt(0x4000), 2)
+      )
 
-      dut.clockDomain.waitSampling()
-      assert(dut.io.cfgReady.toBoolean, "queued descriptor slot should be available")
-      dut.io.cfgBase #= BigInt(0x2000)
-      dut.io.cfgStride #= 16
-      dut.io.cfgCount #= 2
-      dut.io.start #= true
-      dut.clockDomain.waitSampling()
-      dut.io.start #= false
+      var di = 0
+      while (di < descs.length) {
+        dut.clockDomain.waitSampling()
+        if (dut.io.cfgReady.toBoolean) {
+          dut.io.cfgBase #= descs(di)._1
+          dut.io.cfgStride #= 16
+          dut.io.cfgCount #= descs(di)._2
+          dut.io.start #= true
+          dut.clockDomain.waitSampling()
+          dut.io.start #= false
+          di += 1
+        }
+      }
 
       var cycles = 0
-      while (outData.size < 4 && cycles < 80) {
+      while (outData.size < 8 && cycles < 200) {
         dut.clockDomain.waitSampling()
         cycles += 1
       }
 
-      assert(outData.size == 4, s"expected 4 outputs, got ${outData.size}")
-      assert(reqAddrs.toSeq == Seq(BigInt(0x1000), BigInt(0x1010), BigInt(0x2000), BigInt(0x2010)))
-      assert(outData.toSeq == Seq(BigInt(1), BigInt(2), BigInt(3), BigInt(4)))
+      val expectedAddrs = Seq(
+        BigInt(0x1000), BigInt(0x1010),
+        BigInt(0x2000), BigInt(0x2010),
+        BigInt(0x3000), BigInt(0x3010),
+        BigInt(0x4000), BigInt(0x4010)
+      )
+      assert(outData.size == 8, s"expected 8 outputs, got ${outData.size}")
+      assert(reqAddrs.toSeq == expectedAddrs, s"unexpected request addresses: ${reqAddrs.mkString(",")}")
+      assert(outData.toSeq == Seq(BigInt(1), BigInt(2), BigInt(3), BigInt(4), BigInt(5), BigInt(6), BigInt(7), BigInt(8)))
+
+      val reqGaps = reqCycles.sliding(2).collect { case Seq(c0, c1) => c1 - c0 }.toSeq
+      val maxReqGap = if (reqGaps.nonEmpty) reqGaps.max else 0
+      assert(maxReqGap <= 3, s"descriptor chaining introduced excessive request gap: maxReqGap=$maxReqGap")
     }
   }
 }

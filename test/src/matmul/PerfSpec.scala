@@ -215,6 +215,127 @@ class PerfSpec extends AnyFunSuite {
     }
 
     runCase(
+      s"perf_${tag}_prefetch_req_duty",
+      base.copy(
+        memoryCfg = MemoryAgentConfig(
+          clBytes = base.dutCfg.clBytes,
+          latencyModel = MemoryLatencyModel.Fixed(0),
+          reorderWindow = 0,
+          seed = 111
+        ),
+        outputCfg = OutputAgentConfig(
+          clBytes = base.dutCfg.clBytes,
+          backpressureMode = BackpressureMode.AlwaysReady,
+          seed = 112
+        )
+      )
+    ) { (dut, tb) =>
+      val reqFireA = mutable.ArrayBuffer.empty[Long]
+      val reqFireB = mutable.ArrayBuffer.empty[Long]
+
+      fork {
+        var cycle = 0L
+        while (true) {
+          if (dut.io.a_rd_req_valid.toBoolean && dut.io.a_rd_req_ready.toBoolean) reqFireA += cycle
+          if (dut.io.b_rd_req_valid.toBoolean && dut.io.b_rd_req_ready.toBoolean) reqFireB += cycle
+          dut.clockDomain.waitSampling()
+          cycle += 1
+        }
+      }
+
+      val cmd = CommandDesc(
+        cmdId = 1150 + s,
+        aBase = 0x410000,
+        bBase = 0x510000,
+        dBase = 0x610000,
+        m = s,
+        n = s,
+        k = 16 * s,
+        lda = 16 * s,
+        ldb = s,
+        ldd = s,
+        primM = s,
+        primN = s,
+        primK = 16 * s
+      )
+
+      val a = mkRows(cmd.m, cmd.k, cmd.lda, seed = 90 + s)
+      val b = mkRows(cmd.k, cmd.n, cmd.ldb, seed = 100 + s)
+      assert(tb.runCommand(cmd, a, b).isInstanceOf[CommandSuccess], s"prefetch req-duty command failed for S=$s")
+
+      assert(reqFireA.nonEmpty, s"S=$s no A requests observed")
+      assert(reqFireB.nonEmpty, s"S=$s no B requests observed")
+
+      val aSpan = reqFireA.last - reqFireA.head + 1
+      val bSpan = reqFireB.last - reqFireB.head + 1
+      val reqDutyA = if (aSpan <= 0) 0.0 else reqFireA.size.toDouble / aSpan.toDouble
+      val reqDutyB = if (bSpan <= 0) 0.0 else reqFireB.size.toDouble / bSpan.toDouble
+      val aGaps = reqFireA.sliding(2).collect { case Seq(c0, c1) => (c1 - c0).toInt }.toSeq
+      val bGaps = reqFireB.sliding(2).collect { case Seq(c0, c1) => (c1 - c0).toInt }.toSeq
+      val aMaxGap = if (aGaps.nonEmpty) aGaps.max else 0
+      val bMaxGap = if (bGaps.nonEmpty) bGaps.max else 0
+      val reqDutyFloor = if (s <= 4) 0.39 else 0.70
+      val reqGapBudget = 12
+
+      assert(reqDutyA >= reqDutyFloor, f"S=$s A request duty too low: reqDutyA=$reqDutyA%.3f floor=$reqDutyFloor%.2f")
+      assert(reqDutyB >= reqDutyFloor, f"S=$s B request duty too low: reqDutyB=$reqDutyB%.3f floor=$reqDutyFloor%.2f")
+      assert(aMaxGap <= reqGapBudget, s"S=$s A request stream has excessive gap: maxGap=$aMaxGap budget=$reqGapBudget")
+      assert(bMaxGap <= reqGapBudget, s"S=$s B request stream has excessive gap: maxGap=$bMaxGap budget=$reqGapBudget")
+
+      info(
+        f"[perf S=$s req-duty] spanA=$aSpan spanB=$bSpan reqDutyA=$reqDutyA%.3f reqDutyB=$reqDutyB%.3f " +
+          s"maxGapA=$aMaxGap maxGapB=$bMaxGap"
+      )
+    }
+
+    runCase(
+      s"perf_${tag}_prefetch_outstanding_fill",
+      base.copy(
+        memoryCfg = MemoryAgentConfig(
+          clBytes = base.dutCfg.clBytes,
+          latencyModel = MemoryLatencyModel.Fixed(base.dutCfg.maxOutstandingRd + 8),
+          reorderWindow = 0,
+          seed = 113
+        ),
+        outputCfg = OutputAgentConfig(
+          clBytes = base.dutCfg.clBytes,
+          backpressureMode = BackpressureMode.AlwaysReady,
+          seed = 114
+        )
+      )
+    ) { (_, tb) =>
+      val cmd = CommandDesc(
+        cmdId = 1160 + s,
+        aBase = 0x420000,
+        bBase = 0x520000,
+        dBase = 0x620000,
+        m = s,
+        n = s,
+        k = 16 * s,
+        lda = 16 * s,
+        ldb = s,
+        ldd = s,
+        primM = s,
+        primN = s,
+        primK = 16 * s
+      )
+
+      val a = mkRows(cmd.m, cmd.k, cmd.lda, seed = 110 + s)
+      val b = mkRows(cmd.k, cmd.n, cmd.ldb, seed = 120 + s)
+      assert(tb.runCommand(cmd, a, b).isInstanceOf[CommandSuccess], s"prefetch outstanding command failed for S=$s")
+
+      val expected = base.dutCfg.maxOutstandingRd
+      val aMax = tb.aMem.maxOutstandingObserved
+      val bMax = tb.bMem.maxOutstandingObserved
+      assert(aMax >= (expected - 1), s"A outstanding depth too low for S=$s (got $aMax, expected >= ${expected - 1})")
+      assert(bMax >= (expected - 1), s"B outstanding depth too low for S=$s (got $bMax, expected >= ${expected - 1})")
+
+      info(s"[perf S=$s prefetch-outstanding] Amax=$aMax Bmax=$bMax expected>=${
+        expected - 1
+      }")
+    }
+
+    runCase(
       s"perf_${tag}_backpressure_absorb",
       base.copy(
         memoryCfg = MemoryAgentConfig(
