@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Mill and Coursier
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/coursier
+            ~/.mill/ammonite
+            ~/.mill/download
+          key: ${{ runner.os }}-mill-${{ hashFiles('build.mill', '.mill-version') }}
+          restore-keys: |
+            ${{ runner.os }}-mill-
+
+      - name: Install Verilator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator
+
+      - name: Install Mill 0.12.17
+        run: |
+          curl -fsSL https://github.com/com-lihaoyi/mill/releases/download/0.12.17/0.12.17 -o mill
+          chmod +x mill
+
+      - name: Build
+        run: ./mill --no-server spinal101.compile
+
+      - name: Test (Verilator)
+        run: ./mill --no-server spinal101.test
