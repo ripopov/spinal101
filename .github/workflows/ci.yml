@@ -135,6 +135,13 @@ jobs:
         run: |
           python3 -m volare enable --pdk sky130 --pdk-root ./.volare-sky130 "${OPEN_PDKS_REV}"
 
+      - name: Resolve SKY130 PDK Path
+        id: pdk_path
+        run: |
+          pdk_path="$(python3 -m volare path --pdk sky130 --pdk-root ./.volare-sky130 "${OPEN_PDKS_REV}")"
+          echo "pdk_path=${pdk_path}" >> "$GITHUB_OUTPUT"
+          echo "Resolved PDK path: ${pdk_path}"
+
       - name: Run OpenLane Pre-PnR Flow
         run: |
           chmod +x .github/scripts/openlane_prepnr.sh
@@ -143,7 +150,7 @@ jobs:
             -u "$(id -u):$(id -g)" \
             -v "$PWD":"$PWD" \
             -w "$PWD" \
-            -e PDK_ROOT="$PWD/.volare-sky130" \
+            -e PDK_ROOT="${{ steps.pdk_path.outputs.pdk_path }}" \
             -e PDK="${PDK}" \
             -e SCL="${SCL}" \
             -e DESIGN_NAME="Fp32MatrixMul" \

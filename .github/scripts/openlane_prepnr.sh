@@ -20,7 +20,7 @@ fi
 if [[ -d "$PDK_ROOT/$PDK" ]]; then
   pdk_dir="$PDK_ROOT/$PDK"
 else
-  pdk_dir="$(find "$PDK_ROOT" -maxdepth 3 -type d -name "$PDK" | head -n1 || true)"
+  pdk_dir="$(find "$PDK_ROOT" -maxdepth 8 -type d -name "$PDK" | head -n1 || true)"
 fi
 
 if [[ -z "${pdk_dir:-}" || ! -d "$pdk_dir" ]]; then
