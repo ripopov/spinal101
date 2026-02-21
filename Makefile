@@ -10,6 +10,7 @@ PDK ?= sky130A
 SCL ?= sky130_fd_sc_hd
 PDK_FAMILY ?= sky130
 PDK_ROOT_CACHE ?= ./.volare-sky130
+OPENLANE_PDK_ROOT ?=
 
 DESIGN_NAME ?= Fp32MatrixMul
 RTL_PATH ?= generated/Fp32MatrixMul.v
@@ -18,13 +19,12 @@ WORK_DIR ?= build/openlane_prepnr
 CLOCK_PORT ?= clk
 TARGET_PERIOD_NS ?= 10.0
 
-.PHONY: help build test rtl pdk-enable prepnr report flow clean-prepnr
+.PHONY: help build test rtl prepnr report flow clean-prepnr
 
 help:
 	@echo "Targets:"
 	@echo "  make test         - Run Scala/Verilator testbench"
 	@echo "  make rtl          - Generate RTL (default 2x2)"
-	@echo "  make pdk-enable   - Install/enable SKY130 PDK via volare"
 	@echo "  make prepnr       - Run OpenLane pre-PnR synthesis/STA flow"
 	@echo "  make report       - Print timing/gate-count summary"
 	@echo "  make flow         - End-to-end: test + rtl + prepnr + report"
@@ -36,26 +36,21 @@ help:
 	@echo "  TARGET_PERIOD_NS=$(TARGET_PERIOD_NS)"
 
 build:
-	@export JAVA_HOME="$$(dirname "$$(dirname "$$(readlink -f "$$(command -v java)")")")"; \
 	$(MILL) $(MILL_NO_SERVER) spinal101.compile
 
 test:
-	@export JAVA_HOME="$$(dirname "$$(dirname "$$(readlink -f "$$(command -v java)")")")"; \
 	$(MILL) $(MILL_NO_SERVER) spinal101.test
 
 rtl:
-	@export JAVA_HOME="$$(dirname "$$(dirname "$$(readlink -f "$$(command -v java)")")")"; \
 	$(MILL) $(MILL_NO_SERVER) spinal101.run
 
-pdk-enable:
-	python3 -m pip install --upgrade pip volare
-	python3 -m volare enable --pdk $(PDK_FAMILY) --pdk-root $(PDK_ROOT_CACHE) $(OPEN_PDKS_REV)
-
-prepnr: rtl pdk-enable
-	@pdk_path="$$(python3 -m volare path --pdk $(PDK_FAMILY) --pdk-root $(PDK_ROOT_CACHE) $(OPEN_PDKS_REV))"; \
+prepnr: rtl
+	@pdk_path="$(OPENLANE_PDK_ROOT)"; \
+	if [[ -z "$$pdk_path" ]]; then \
+		pdk_path="$$(python3 -m volare path --pdk $(PDK_FAMILY) --pdk-root $(PDK_ROOT_CACHE) $(OPEN_PDKS_REV))"; \
+	fi; \
 	echo "Using PDK path: $$pdk_path"; \
 	chmod +x .github/scripts/openlane_prepnr.sh; \
-	docker pull "$(OPENLANE_IMAGE)"; \
 	if docker run --rm -v "$$PWD":"$$PWD" -w "$$PWD" "$(OPENLANE_IMAGE)" true >/dev/null 2>&1; then \
 		echo "Running OpenLane with bind mount"; \
 		docker run --rm \

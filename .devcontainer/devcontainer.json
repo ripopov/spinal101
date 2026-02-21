@@ -15,6 +15,8 @@
     "MILL_VERSION": "0.12.17",
     "OPENLANE_IMAGE": "ghcr.io/efabless/openlane2:2.0.4",
     "OPEN_PDKS_REV": "0fe599b2afb6708d281543108caf8310912f54af",
+    "PDK_FAMILY": "sky130",
+    "PDK_ROOT_CACHE": "./.volare-sky130",
     "PDK": "sky130A",
     "SCL": "sky130_fd_sc_hd"
   },

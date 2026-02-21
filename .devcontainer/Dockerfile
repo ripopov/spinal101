@@ -25,5 +25,4 @@ RUN python3 -m venv /opt/volare-venv && \
     /opt/volare-venv/bin/pip install --no-cache-dir --upgrade pip && \
     /opt/volare-venv/bin/pip install --no-cache-dir volare
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PATH=/opt/volare-venv/bin:${PATH}
