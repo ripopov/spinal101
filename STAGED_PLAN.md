@@ -19,7 +19,7 @@
 - [x] **Stage 11** — Zero-bubble A/B supply pipeline
 - [x] **Stage 12** — Drain/compute overlap with bank rotation
 - [x] **Stage 13** — Multi-command pipelining and in-order commit
-- [ ] **Stage 14** — Utilization closure and CI gating
+- [x] **Stage 14** — Utilization closure and CI gating
 
 ---
 

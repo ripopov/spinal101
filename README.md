@@ -192,6 +192,33 @@ make prepnr PREPNR_S=16
 
 `make flow` runs test + pre-PnR + report, and uses the same pre-PnR default (`PREPNR_S=4`).
 
+## Utilization Gates (Stage 14)
+
+`UtilizationSpec` now enforces quantitative utilization gates and exports per-scenario metrics to:
+
+- `build/utilization_gates/*.metrics.env`
+
+Scenarios covered in CI (`S=4` and `S=16`):
+
+- Ideal no-latency/no-backpressure stream
+- Random-latency stream with outstanding-depth checks
+- Output-backpressure sensitivity sweep
+
+Current gate outcomes (from local `mill spinal101.test.testOnly matmul.UtilizationSpec`):
+
+| Scenario | S=4 | S=16 |
+| --- | --- | --- |
+| Ideal array utilization | 1.000000 | 1.000000 |
+| Ideal stream utilization | 1.000000 | 1.000000 |
+| Random-latency stream utilization | 1.000000 | 1.000000 |
+| Backpressure sweep stream utilization (bp0/bp1/bp2/bp3) | 0.275653 / 0.275616 / 0.275616 / 0.275579 | 0.403170 / 0.403131 / 0.403170 / 0.403170 |
+
+Remaining non-ideal corner cases:
+
+- `stall_a_not_ready` and `stall_bank_hazard` remain high in long-window accounting; the controller is correct but still conservative around queue/bank transition windows.
+- Backpressure sweep currently shows only minor utilization deltas because output buffering absorbs most periodic stalls for these workloads.
+- `stall_output_backpressure_cycles` remains zero in these gated runs; heavier sustained output throttling is required to move this counter.
+
 ## Output Artifacts
 
 Pre-PnR outputs are written under `build/openlane_prepnr/`:

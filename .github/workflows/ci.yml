@@ -15,6 +15,13 @@ env:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    outputs:
+      util_ideal_s4_array: ${{ steps.util_metrics.outputs.ideal_s4_array }}
+      util_ideal_s16_array: ${{ steps.util_metrics.outputs.ideal_s16_array }}
+      util_ideal_s4_stream: ${{ steps.util_metrics.outputs.ideal_s4_stream }}
+      util_ideal_s16_stream: ${{ steps.util_metrics.outputs.ideal_s16_stream }}
+      util_randlat_s4_stream: ${{ steps.util_metrics.outputs.randlat_s4_stream }}
+      util_randlat_s16_stream: ${{ steps.util_metrics.outputs.randlat_s16_stream }}
 
     steps:
       - name: Checkout
@@ -69,12 +76,108 @@ jobs:
             fi
           fi
 
+      - name: Utilization Metrics Summary
+        if: ${{ always() }}
+        id: util_metrics
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          output_path = os.environ["GITHUB_OUTPUT"]
+          metric_files = sorted(glob.glob("build/utilization_gates/*.metrics.env"))
+
+          default_outputs = {
+              "ideal_s4_array": "n/a",
+              "ideal_s16_array": "n/a",
+              "ideal_s4_stream": "n/a",
+              "ideal_s16_stream": "n/a",
+              "randlat_s4_stream": "n/a",
+              "randlat_s16_stream": "n/a",
+          }
+
+          with open(output_path, "a", encoding="utf-8") as out_f:
+              for key, value in default_outputs.items():
+                  out_f.write(f"{key}={value}\n")
+
+          if not metric_files:
+              with open(summary_path, "a", encoding="utf-8") as summary_f:
+                  summary_f.write("## Utilization Gates\n")
+                  summary_f.write("- No utilization metrics were generated.\n")
+              raise SystemExit(0)
+
+          rows = []
+          by_key = {}
+          for path in metric_files:
+              data = {}
+              with open(path, "r", encoding="utf-8") as in_f:
+                  for line in in_f:
+                      line = line.strip()
+                      if not line or line.startswith("#") or "=" not in line:
+                          continue
+                      k, v = line.split("=", 1)
+                      data[k] = v
+              rows.append(data)
+              by_key[(data.get("scenario", ""), data.get("s", ""))] = data
+
+          with open(summary_path, "a", encoding="utf-8") as summary_f:
+              summary_f.write("## Utilization Gates\n")
+              summary_f.write("| Scenario | S | Array Util | Stream Util | no_step | a_not_ready | bank_hazard | out_bp | err_flush |\n")
+              summary_f.write("| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n")
+              for row in rows:
+                  summary_f.write(
+                      f"| {row.get('scenario', 'n/a')} | {row.get('s', 'n/a')} | "
+                      f"{row.get('array_utilization', 'n/a')} | {row.get('stream_utilization', 'n/a')} | "
+                      f"{row.get('stall_no_step_cycles', 'n/a')} | {row.get('stall_a_not_ready_cycles', 'n/a')} | "
+                      f"{row.get('stall_bank_hazard_cycles', 'n/a')} | {row.get('stall_output_backpressure_cycles', 'n/a')} | "
+                      f"{row.get('stall_error_flush_cycles', 'n/a')} |\n"
+                  )
+
+              summary_f.write("\n### Utilization Trend (S4 vs S16)\n")
+              summary_f.write("| Scenario | S4 Array | S16 Array | S4 Stream | S16 Stream |\n")
+              summary_f.write("| --- | --- | --- | --- | --- |\n")
+              for scenario in [
+                  "ideal",
+                  "random_latency",
+                  "backpressure_bp0",
+                  "backpressure_bp1",
+                  "backpressure_bp2",
+                  "backpressure_bp3",
+              ]:
+                  s4 = by_key.get((scenario, "4"), {})
+                  s16 = by_key.get((scenario, "16"), {})
+                  summary_f.write(
+                      f"| {scenario} | {s4.get('array_utilization', 'n/a')} | {s16.get('array_utilization', 'n/a')} | "
+                      f"{s4.get('stream_utilization', 'n/a')} | {s16.get('stream_utilization', 'n/a')} |\n"
+                  )
+
+          exports = {
+              "ideal_s4_array": by_key.get(("ideal", "4"), {}).get("array_utilization", "n/a"),
+              "ideal_s16_array": by_key.get(("ideal", "16"), {}).get("array_utilization", "n/a"),
+              "ideal_s4_stream": by_key.get(("ideal", "4"), {}).get("stream_utilization", "n/a"),
+              "ideal_s16_stream": by_key.get(("ideal", "16"), {}).get("stream_utilization", "n/a"),
+              "randlat_s4_stream": by_key.get(("random_latency", "4"), {}).get("stream_utilization", "n/a"),
+              "randlat_s16_stream": by_key.get(("random_latency", "16"), {}).get("stream_utilization", "n/a"),
+          }
+          with open(output_path, "a", encoding="utf-8") as out_f:
+              for key, value in exports.items():
+                  out_f.write(f"{key}={value}\n")
+          PY
+
       - name: Upload test log
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: verilator-test-log
           path: build/ci/verilator-test.log
+
+      - name: Upload utilization metrics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: utilization-gate-metrics
+          path: build/utilization_gates
 
   openlane-prepnr:
     runs-on: ubuntu-latest
@@ -190,6 +293,12 @@ jobs:
         env:
           TEST_RESULT: ${{ needs.build-and-test.result }}
           OPENLANE_RESULT: ${{ needs.openlane-prepnr.result }}
+          UTIL_IDEAL_S4_ARRAY: ${{ needs.build-and-test.outputs.util_ideal_s4_array }}
+          UTIL_IDEAL_S16_ARRAY: ${{ needs.build-and-test.outputs.util_ideal_s16_array }}
+          UTIL_IDEAL_S4_STREAM: ${{ needs.build-and-test.outputs.util_ideal_s4_stream }}
+          UTIL_IDEAL_S16_STREAM: ${{ needs.build-and-test.outputs.util_ideal_s16_stream }}
+          UTIL_RANDLAT_S4_STREAM: ${{ needs.build-and-test.outputs.util_randlat_s4_stream }}
+          UTIL_RANDLAT_S16_STREAM: ${{ needs.build-and-test.outputs.util_randlat_s16_stream }}
           GATE_COUNT: ${{ needs.openlane-prepnr.outputs.gate_count }}
           MAX_FREQUENCY_MHZ: ${{ needs.openlane-prepnr.outputs.max_frequency_mhz }}
           WORST_SLACK_NS: ${{ needs.openlane-prepnr.outputs.worst_slack_ns }}
@@ -211,3 +320,10 @@ jobs:
           echo "| Critical path startpoint | ${CRITICAL_STARTPOINT:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Critical path endpoint | ${CRITICAL_ENDPOINT:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Max frequency estimate (MHz) | ${MAX_FREQUENCY_MHZ:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Utilization Gate Trend" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | S=4 | S=16 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ideal array utilization | ${UTIL_IDEAL_S4_ARRAY:-n/a} | ${UTIL_IDEAL_S16_ARRAY:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ideal stream utilization | ${UTIL_IDEAL_S4_STREAM:-n/a} | ${UTIL_IDEAL_S16_STREAM:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Random-latency stream utilization | ${UTIL_RANDLAT_S4_STREAM:-n/a} | ${UTIL_RANDLAT_S16_STREAM:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
