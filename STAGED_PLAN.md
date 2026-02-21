@@ -20,6 +20,12 @@
 - [x] **Stage 12** — Drain/compute overlap with bank rotation
 - [x] **Stage 13** — Multi-command pipelining and in-order commit
 - [x] **Stage 14** — Utilization closure and CI gating
+- [ ] **Stage 15** — Utilization metric hardening and root-cause attribution
+- [ ] **Stage 16** — Multi-step continuous A/B prefetch
+- [ ] **Stage 17** — Deep staged-tile buffering and injector decoupling
+- [ ] **Stage 18** — Drain decoupling and hazard narrowing
+- [ ] **Stage 19** — FEED run-length optimization
+- [ ] **Stage 20** — Near-100% PE utilization CI closure
 
 ---
 
@@ -442,6 +448,134 @@ warm-up, and status ordering remains correct in all tests.
 
 **Exit criterion:** All utilization gates pass in CI for both `S=4` and `S=16`; controller redesign
 is considered complete.
+
+---
+
+## Stage 15 — Utilization metric hardening and root-cause attribution
+
+**Goal:** Make low `utilInjectFullCycle` directly actionable by splitting idle time into precise causes
+and using a consistent measurement window.
+
+**Work items:**
+
+1. Add a dedicated utilization measurement window in RTL/testbench:
+   - start at first `traceFeedStart`
+   - stop at last `traceDrainDone` for the measured command batch
+2. Export derived metrics for each scenario:
+   - `feed_duty = utilInjectFullCycles / measured_window_cycles`
+   - `req_duty_a = cycles(a_rd_req_valid && a_rd_req_ready) / measured_window_cycles`
+   - `req_duty_b = cycles(b_rd_req_valid && b_rd_req_ready) / measured_window_cycles`
+3. Add explicit bucketization for non-FEED cycles:
+   - prefetch/setup
+   - bank-hazard wait
+   - drain enqueue bookkeeping
+   - output backpressure
+4. Extend `UtilizationSpec` metrics files with these fields and add per-scenario assertions that
+   all non-FEED measured cycles are fully attributed to exactly one cause.
+
+**Exit criterion:** For both `S=4` and `S=16`, utilization reports show complete measured-cycle
+attribution and stable `feed_duty` values across repeated seeds.
+
+---
+
+## Stage 16 — Multi-step continuous A/B prefetch
+
+**Goal:** Eliminate large gaps on A/B read request buses by prefetching multiple upcoming steps
+without waiting for each step’s inject completion.
+
+**Work items:**
+
+1. Replace single-step prefetch control with a queued read-plan pipeline:
+   - enqueue descriptors for multiple future steps from `stepIssueQ`
+   - allow `ReadEngine` to transition directly to next queued plan
+2. Keep A/B read issue active whenever plan queue is non-empty and credits are available.
+3. Increase effective in-flight depth:
+   - maintain near-full `outstanding` under ideal memory for both A and B.
+4. Add tests that assert sustained request duty (`a_rd_req_valid&&ready`, `b_rd_req_valid&&ready`)
+   under no-latency/no-backpressure conditions.
+
+**Exit criterion:** Ideal-memory scenarios show high sustained read duty (target `>= 0.90`) and
+near-max outstanding depth for A and B over measured windows.
+
+---
+
+## Stage 17 — Deep staged-tile buffering and injector decoupling
+
+**Goal:** Remove ping-pong staging bottlenecks by allowing prefetch to run ahead of inject/drain.
+
+**Work items:**
+
+1. Replace 2-bank stage buffers with N-entry staged-tile FIFOs (configurable depth, e.g. 8).
+2. Separate producer/consumer pointers for A/B staged tiles and preserve strict step ordering.
+3. Allow prefetch to keep filling staged tiles while injector drains existing entries.
+4. Add assertions for no overflow/underflow and exact step ordering at inject input.
+
+**Exit criterion:** Under ideal memory, injector no longer waits for staged-tile availability after
+warm-up (staged-buffer-empty stalls effectively eliminated).
+
+---
+
+## Stage 18 — Drain decoupling and hazard narrowing
+
+**Goal:** Minimize cycles classified as bank hazard by narrowing hazard scope and removing
+drain-enqueue bookkeeping from the hazard path.
+
+**Work items:**
+
+1. Split `stall_bank_hazard` into:
+   - true bank conflict
+   - drain queue bookkeeping delay
+2. Move drain enqueue into a decoupled path so FEED-to-next-step transition is not blocked by
+single-cycle drain bookkeeping.
+3. Keep bank safety with explicit per-bank/per-row ownership but avoid conservative full-bank
+blocking where not required.
+4. Add tests verifying hazard counter drops without functional regressions.
+
+**Exit criterion:** In ideal no-backpressure runs, true bank-conflict stalls are near zero after
+warm-up, and bookkeeping stalls are bounded to a small fixed budget.
+
+---
+
+## Stage 19 — FEED run-length optimization
+
+**Goal:** Maximize continuous FEED runs to approach constant PE activity.
+
+**Work items:**
+
+1. Add step chaining in injector:
+   - transition FEED directly to next ready step when legal
+   - avoid unnecessary `InjectState.IDLE` residency between steps
+2. Prioritize injector consumption from ready staged steps while prefetch continues in parallel.
+3. Add run-length metrics:
+   - longest FEED streak
+   - average FEED streak
+   - count of FEED breaks and their causes
+4. Add directed tests for long command batches and mixed primitive sizes.
+
+**Exit criterion:** Ideal scenarios show long FEED streaks with minimal breaks, and measured
+`feed_duty >= 0.95` for both `S=4` and `S=16`.
+
+---
+
+## Stage 20 — Near-100% PE utilization CI closure
+
+**Goal:** Lock in near-100% PE utilization with explicit CI gates and documentation.
+
+**Work items:**
+
+1. Add CI gates for new utilization metrics:
+   - `feed_duty` thresholds
+   - read-request duty thresholds for A/B
+   - bounded true bank-conflict stalls
+2. Keep existing correctness/performance/error-path suites unchanged and green.
+3. Export trend tables for:
+   - `feed_duty`
+   - A/B request duty
+   - FEED run-length metrics
+4. Update README with interpretation guidance for all utilization counters.
+
+**Exit criterion:** CI passes near-100% utilization gates for `S=4` and `S=16` in ideal scenarios,
+with no regressions in correctness, error handling, or existing performance contracts.
 
 ---
 

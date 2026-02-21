@@ -386,6 +386,76 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
     }
   }
 
+  test("integration back-to-back commands with large primitives for long output bursts") {
+    val cfg = defaultHarnessConfigS4()
+    runCase("systolic_int_back_to_back_long_prim", cfg) { tb =>
+      val s = cfg.dutCfg.s
+      val cmdCount = 4
+      val tile = 8 * s
+
+      val cmds = (0 until cmdCount).map { i =>
+        val aBase = BigInt(0x170000) + BigInt(i) * 0x90000
+        val bBase = aBase + BigInt(0x30000)
+        val dBase = aBase + BigInt(0x60000)
+        CommandDesc(
+          cmdId = 360 + i,
+          aBase = aBase,
+          bBase = bBase,
+          dBase = dBase,
+          m = tile,
+          n = tile,
+          k = s,
+          lda = s,
+          ldb = tile,
+          ldd = tile,
+          primM = tile,
+          primN = tile,
+          primK = s
+        )
+      }
+
+      val queued = cmds.zipWithIndex.map { case (cmd, i) =>
+        val a = mkRows(cmd.m, cmd.k, cmd.lda, 95 + i * 2)
+        val b = mkRows(cmd.k, cmd.n, cmd.ldb, 96 + i * 2)
+        tb.enqueueCommand(cmd, a, b)
+      }
+
+      queued.foreach { q =>
+        assert(tb.awaitCommand(q).isInstanceOf[CommandSuccess], s"failed cmdId=${q.cmd.cmdId}")
+      }
+
+      val fireCycles = tb.out.fireCycles.toSeq
+      val expectedBeats = cmds.map(c => c.m * (c.ldd / s)).sum
+      assert(fireCycles.length == expectedBeats, s"unexpected D beat count: got=${fireCycles.length} exp=$expectedBeats")
+
+      val gaps = fireCycles.sliding(2).collect { case Seq(c0, c1) => (c1 - c0).toInt }.toSeq
+      val maxGap = if (gaps.nonEmpty) gaps.max else 0
+      val avgGap = if (gaps.nonEmpty) gaps.sum.toDouble / gaps.length else 0.0
+      val tightGapRatio = if (gaps.nonEmpty) gaps.count(_ <= 4).toDouble / gaps.length else 1.0
+      val longestTightRun = {
+        var best = 1
+        var cur = 1
+        gaps.foreach { g =>
+          if (g <= 4) {
+            cur += 1
+            if (cur > best) best = cur
+          } else {
+            cur = 1
+          }
+        }
+        best
+      }
+
+      info(
+        f"[b2b long-prim] cmds=$cmdCount beats=$expectedBeats maxGap=$maxGap avgGap=$avgGap%.2f " +
+          f"tightGapRatio=$tightGapRatio%.3f longestTightRun=$longestTightRun"
+      )
+
+      assert(tightGapRatio >= 0.90, f"too many large output gaps for long-primitive case: tightGapRatio=$tightGapRatio%.3f")
+      assert(longestTightRun >= 64, s"expected long tight run in output stream, got=$longestTightRun")
+    }
+  }
+
   test("integration error fence poisons younger queued commands and resumes cleanly") {
     val base = defaultHarnessConfigS4()
     val cfg = base.copy(
