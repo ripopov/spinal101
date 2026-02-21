@@ -83,12 +83,12 @@ EOF
 openroad -exit "$WORK_DIR/prepnr_sta.tcl" > "$openroad_log" 2>&1
 cp "$openroad_log" "$checks_rpt"
 
-gate_count="$(awk '/Number of cells:/ {cells=$4} END {print cells}' "$yosys_log" || true)"
+gate_count="$(grep -E 'Number of cells:' "$yosys_log" | tail -n1 | grep -Eo '[0-9]+' | tail -n1 || true)"
 if [[ -z "$gate_count" ]]; then
   gate_count="n/a"
 fi
 
-worst_slack_ns="$(awk '/worst slack/ {value=$3} END {print value}' "$openroad_log" || true)"
+worst_slack_ns="$(grep -E 'worst slack' "$openroad_log" | tail -n1 | grep -Eo '[-]?[0-9]+([.][0-9]+)?' | tail -n1 || true)"
 if [[ -z "$worst_slack_ns" ]]; then
   worst_slack_ns="n/a"
 fi
