@@ -10,6 +10,7 @@ object SystolicMatmulTb {
   sealed trait CommandRunResult
   final case class CommandSuccess(cyclesWaited: Int) extends CommandRunResult
   final case class CommandFailure(reason: String) extends CommandRunResult
+  final case class QueuedCommand(cmd: CommandDesc, expectedD: Array[Int])
 
   final case class HarnessTimeouts(
       acceptCycles: Int = 500,
@@ -111,6 +112,11 @@ final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessC
   }
 
   def runCommand(cmd: CommandDesc, aRows: Seq[Seq[Int]], bRows: Seq[Seq[Int]]): CommandRunResult = {
+    val queued = enqueueCommand(cmd, aRows, bRows)
+    awaitCommand(queued)
+  }
+
+  def enqueueCommand(cmd: CommandDesc, aRows: Seq[Seq[Int]], bRows: Seq[Seq[Int]]): QueuedCommand = {
     populateMatrixRows(aMem, cmd.aBase, cmd.lda, aRows)
     populateMatrixRows(bMem, cmd.bBase, cmd.ldb, bRows)
 
@@ -130,16 +136,21 @@ final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessC
     )
 
     cmdDriver.enqueue(cmd)
+    expectedCompletionOrder.enqueue(cmd.cmdId)
+    QueuedCommand(cmd, expectedD)
+  }
+
+  def awaitCommand(queued: QueuedCommand): CommandRunResult = {
+    val cmd = queued.cmd
     val accepted = cmdDriver.waitAccepted(cmd.cmdId, cfg.timeouts.acceptCycles)
     if (!accepted) return CommandFailure(s"command handshake timeout for cmd_id=${cmd.cmdId}")
 
-    expectedCompletionOrder.enqueue(cmd.cmdId)
     val statusOpt = sts.waitFor(cmd.cmdId, cfg.timeouts.statusCycles, dut.clockDomain)
     statusOpt match {
       case None => CommandFailure(s"status timeout for cmd_id=${cmd.cmdId}")
       case Some(status) if !status.ok => CommandFailure(s"command failed with err_code=${status.errCode} for cmd_id=${cmd.cmdId}")
       case Some(_) =>
-        compareOutputAgainstExpected(cmd, expectedD) match {
+        compareOutputAgainstExpected(cmd, queued.expectedD) match {
           case Some(msg) => CommandFailure(msg)
           case None => CommandSuccess(cfg.timeouts.statusCycles)
         }
@@ -217,6 +228,8 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
   import SystolicMatmulTb._
 
   private def f2i(f: Float): Int = java.lang.Float.floatToRawIntBits(f)
+  private def envEnabled(name: String): Boolean =
+    sys.env.get(name).exists(v => Set("1", "true", "yes", "on").contains(v.toLowerCase))
 
   private def mkRows(rows: Int, cols: Int, ld: Int, seed: Int): Seq[Seq[Int]] = {
     val rng = new Random(seed)
@@ -226,7 +239,13 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
   }
 
   private def runCase(name: String, cfg: HarnessConfig)(body: SystolicMatmulTb => Unit): Unit = {
-    SpinalSimConfig().withVerilator.compile(SystolicMatmul(cfg.dutCfg)).doSim(name) { dut =>
+    val simCfg = SpinalSimConfig().withVerilator
+    if (envEnabled("SYSTOLIC_TB_FST")) {
+      simCfg.withFstWave.workspacePath("build/waves").workspaceName(name).waveFilePrefix(name)
+      info(s"[wave] FST dumping enabled for '$name' under build/waves/")
+    }
+
+    simCfg.compile(SystolicMatmul(cfg.dutCfg)).doSim(name) { dut =>
       dut.clockDomain.forkStimulus(2)
       val tb = new SystolicMatmulTb(dut, cfg)
       tb.startAgents()
@@ -300,16 +319,59 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
     }
   }
 
-  test("integration back-to-back commands") {
+  test("integration many back-to-back commands with small primitives stream output") {
     val cfg = defaultHarnessConfigS4()
     runCase("systolic_int_back_to_back", cfg) { tb =>
       val s = cfg.dutCfg.s
-      val cmd0 = CommandDesc(300, 0x70000, 0x80000, 0x90000, s, s, s, s, s, s, s, s, s)
-      val cmd1 = CommandDesc(301, 0xa0000, 0xb0000, 0xc0000, s, s, s, s, s, s, s, s, s)
-      val a0 = mkRows(s, s, s, 55); val b0 = mkRows(s, s, s, 56)
-      val a1 = mkRows(s, s, s, 57); val b1 = mkRows(s, s, s, 58)
-      assert(tb.runCommand(cmd0, a0, b0).isInstanceOf[CommandSuccess])
-      assert(tb.runCommand(cmd1, a1, b1).isInstanceOf[CommandSuccess])
+      val cmdCount = 6
+      val cmds = (0 until cmdCount).map { i =>
+        val aBase = BigInt(0x70000) + BigInt(i) * 0x30000
+        val bBase = aBase + BigInt(0x10000)
+        val dBase = aBase + BigInt(0x20000)
+        CommandDesc(
+          cmdId = 300 + i,
+          aBase = aBase,
+          bBase = bBase,
+          dBase = dBase,
+          m = 4 * s,
+          n = 4 * s,
+          k = s,
+          lda = s,
+          ldb = 4 * s,
+          ldd = 4 * s,
+          primM = 2 * s,
+          primN = 2 * s,
+          primK = s
+        )
+      }
+
+      // Queue all commands up-front to create sustained cmd_valid traffic.
+      val queued = cmds.zipWithIndex.map { case (cmd, i) =>
+        val a = mkRows(cmd.m, cmd.k, cmd.lda, 55 + i * 2)
+        val b = mkRows(cmd.k, cmd.n, cmd.ldb, 56 + i * 2)
+        tb.enqueueCommand(cmd, a, b)
+      }
+
+      queued.foreach { q =>
+        assert(tb.awaitCommand(q).isInstanceOf[CommandSuccess], s"failed cmdId=${q.cmd.cmdId}")
+      }
+
+      val fireCycles = tb.out.fireCycles.toSeq
+      val expectedBeats = cmds.map(c => c.m * (c.ldd / s)).sum
+      assert(fireCycles.length == expectedBeats, s"unexpected D beat count: got=${fireCycles.length} exp=$expectedBeats")
+
+      val gaps = fireCycles.sliding(2).collect { case Seq(c0, c1) => (c1 - c0).toInt }.toSeq
+      val maxGap = if (gaps.nonEmpty) gaps.max else 0
+      val avgGap = if (gaps.nonEmpty) gaps.sum.toDouble / gaps.length else 0.0
+      val smallGapRatio = if (gaps.nonEmpty) gaps.count(_ <= 4).toDouble / gaps.length else 1.0
+      val largeGapCount = gaps.count(_ > 12)
+
+      info(
+        f"[b2b stream] cmds=$cmdCount beats=$expectedBeats maxGap=$maxGap avgGap=$avgGap%.2f smallGapRatio=$smallGapRatio%.3f largeGapCount=$largeGapCount"
+      )
+
+      assert(smallGapRatio >= 0.80, f"too many wide output bubbles: smallGapRatio=$smallGapRatio%.3f")
+      assert(largeGapCount <= (cmdCount * 4), s"too many large output bubbles: count=$largeGapCount")
     }
   }
 

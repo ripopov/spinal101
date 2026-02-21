@@ -13,7 +13,13 @@
 - [x] **Stage 5** — RTL: Memory engines, transpose buffer, command frontend
 - [x] **Stage 6** — RTL: Drain, output packer, status — full top-level integration
 - [x] **Stage 7** — Performance tests (throughput and overlap contracts)
-- [ ] **Stage 8** — Pre-PnR STA and timing closure
+- [x] **Stage 8** — Pre-PnR STA and timing closure
+- [ ] **Stage 9** — Controller utilization instrumentation and baseline
+- [ ] **Stage 10** — Controller decomposition into pipelined engines
+- [ ] **Stage 11** — Zero-bubble A/B supply pipeline
+- [ ] **Stage 12** — Drain/compute overlap with bank rotation
+- [ ] **Stage 13** — Multi-command pipelining and in-order commit
+- [ ] **Stage 14** — Utilization closure and CI gating
 
 ---
 
@@ -305,6 +311,137 @@ should now produce correct results.
 
 **Exit criterion:** `make flow` completes successfully. Pre-PnR metrics are recorded and
 reported. CI green.
+
+---
+
+## Controller Pipelining Redesign (100% Utilization Track)
+
+**Objective:** Redesign the top-level controller so the systolic array is continuously busy in
+steady-state operation (no controller-induced bubbles) and command streaming is near-continuous.
+
+**Utilization definitions (must be implemented as counters in simulation):**
+
+- `inject_full_cycle`: cycle where all `S` A lanes and all `S` B lanes are valid at systolic input.
+- `inject_window_cycle`: cycle where the controller is in active compute window (excluding cold start
+  and final command drain flush).
+- `array_utilization = inject_full_cycle / inject_window_cycle`.
+- `stall_cause` breakdown (one-hot per cycle): `no_step`, `a_not_ready`, `b_not_ready`,
+  `bank_hazard`, `drain_blocked`, `output_backpressure`, `error_flush`.
+
+Target in no-backpressure, no-memory-latency steady-state:
+- `array_utilization == 1.0` over long windows (`>= 2000` cycles).
+- max contiguous idle run inside steady-state window: `<= 1` cycle.
+
+---
+
+## Stage 9 — Controller utilization instrumentation and baseline
+
+**Goal:** Make utilization and bubble sources observable before redesign.
+
+**Work items:**
+
+1. Add cycle counters and stall-cause counters to `SystolicMatmul` (simulation-visible only).
+2. Add trace points for phase boundaries (command accepted, feed start, drain start, drain done).
+3. Add `UtilizationSpec` baseline test for current controller:
+   - Long command stream, small primitives, zero memory latency, always-ready output.
+   - Reports utilization and per-cause bubble counts.
+4. Emit a machine-readable summary artifact (e.g., JSON or `metrics.env`) from the test.
+
+**Exit criterion:** Baseline utilization and stall breakdown are reproducibly reported for `S=4`
+and `S=16`.
+
+---
+
+## Stage 10 — Controller decomposition into pipelined engines
+
+**Goal:** Replace monolithic serialized FSM with decoupled pipeline stages.
+
+**Work items:**
+
+1. Split controller into independent handshake-driven engines:
+   - command dispatch
+   - step generation
+   - prefetch/issue
+   - inject
+   - drain
+   - commit/status
+2. Introduce in-flight context records (`cmd_id`, `pi/pj/pk/mi/nj`, `bank`, `clear`, `drain`).
+3. Add bounded FIFOs between engines with credit/ready flow control.
+4. Add explicit hazard scoreboard to prevent illegal bank/row conflicts.
+
+**Exit criterion:** Functional equivalence retained (`mill spinal101.test` green), and no global
+single-state bottleneck remains in controller datapath.
+
+---
+
+## Stage 11 — Zero-bubble A/B supply pipeline
+
+**Goal:** Ensure next micro-tile inputs are ready before current injection ends.
+
+**Work items:**
+
+1. Extend read engines to accept queued descriptors while previous descriptor is still active.
+2. Convert A transpose and B staging into true ping-pong buffers with independent fill/read domains.
+3. Add prefetch lookahead (`>= 1` micro-tile) in scheduler-to-read path.
+4. Guarantee inject stage can advance directly from tile `n` to tile `n+1` without waiting for
+   `LOAD_AB`.
+
+**Exit criterion:** Under zero-latency memory and no backpressure, inject gap between consecutive
+micro-tiles is `<= 1` cycle after warm-up.
+
+---
+
+## Stage 12 — Drain/compute overlap with bank rotation
+
+**Goal:** Remove drain as a blocking phase for next compute step.
+
+**Work items:**
+
+1. Make bank rotation explicit and deterministic each drain epoch.
+2. Allow compute on active bank while previous bank drains concurrently.
+3. Refactor `DrainPacker` interface to non-blocking enqueue/consume semantics.
+4. Keep command-final flush as a barrier only at true end-of-command commit.
+
+**Exit criterion:** `drain_blocked` stall cause is zero in no-backpressure tests; array keeps
+feeding while drain is active.
+
+---
+
+## Stage 13 — Multi-command pipelining and in-order commit
+
+**Goal:** Pipeline command stream across controller stages while preserving ordering guarantees.
+
+**Work items:**
+
+1. Allow next command dispatch/step/prefetch while prior command is still in drain/commit.
+2. Track per-command completion tokens (`writes_done`, `drains_done`, `errors_seen`).
+3. Emit status strictly in command order using commit queue.
+4. Implement poison/fence error handling that flushes safely and resumes cleanly.
+
+**Exit criterion:** Back-to-back command stream (small primitives) has no `no_step` bubbles after
+warm-up, and status ordering remains correct in all tests.
+
+---
+
+## Stage 14 — Utilization closure and CI gating
+
+**Goal:** Prove and continuously enforce 100% steady-state utilization target.
+
+**Work items:**
+
+1. Add utilization-focused tests:
+   - steady-state no-latency/no-backpressure stream (`S=4`, `S=16`)
+   - random memory latency with sufficient outstanding depth
+   - output backpressure sensitivity sweep
+2. Gate pass/fail on quantitative thresholds:
+   - steady-state `array_utilization == 1.0` in ideal case
+   - end-to-end stream utilization (including boundaries) `>= 0.98`
+   - stall counters within strict per-cause budgets
+3. Export utilization summary in CI and include trend table in workflow summary.
+4. Document achieved utilization and remaining non-ideal corner cases.
+
+**Exit criterion:** All utilization gates pass in CI for both `S=4` and `S=16`; controller redesign
+is considered complete.
 
 ---
 
