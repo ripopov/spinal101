@@ -18,3 +18,16 @@ case class CmdDesc(cfg: SystolicMatmulConfig) extends Bundle {
   val primK = UInt(16 bits)
   val flags = Bits(8 bits)
 }
+
+case class DWriteEntry(cfg: SystolicMatmulConfig) extends Bundle {
+  val addr = UInt(cfg.addrBits bits)
+  val data = Bits(cfg.clBits bits)
+  val last = Bool()
+  val cmdId = UInt(16 bits)
+}
+
+case class StatusEntry() extends Bundle {
+  val cmdId = UInt(16 bits)
+  val ok = Bool()
+  val errCode = Bits(8 bits)
+}

@@ -38,11 +38,13 @@ case class ReorderBuffer(depth: Int, dataWidth: Int) extends Component {
   io.rdValid := allocated(head) && complete(head)
   io.rdData := dataMem(head)
 
-  when(io.allocValid && io.allocReady) {
+  val doAlloc = io.allocValid && io.allocReady
+  val doRead = io.rdValid && io.rdReady
+
+  when(doAlloc) {
     allocated(tail) := True
     complete(tail) := False
     tail := tail + 1
-    used := used + 1
   }
 
   when(io.wrValid) {
@@ -51,10 +53,15 @@ case class ReorderBuffer(depth: Int, dataWidth: Int) extends Component {
     complete(io.wrTag) := True
   }
 
-  when(io.rdValid && io.rdReady) {
+  when(doRead) {
     allocated(head) := False
     complete(head) := False
     head := head + 1
+  }
+
+  when(doAlloc && !doRead) {
+    used := used + 1
+  } elsewhen(!doAlloc && doRead) {
     used := used - 1
   }
 

@@ -42,6 +42,7 @@ case class ReadEngine(
 
   val active = Reg(Bool()) init (False)
   val nextAddr = Reg(UInt(addrBits bits)) init (0)
+  val stride = Reg(UInt(addrBits bits)) init (0)
   val remaining = Reg(UInt(16 bits)) init (0)
   val outstanding = Reg(UInt(log2Up(maxOutstandingRd + 1) bits)) init (0)
   val errorReg = Reg(Bool()) init (False)
@@ -49,6 +50,7 @@ case class ReadEngine(
   when(io.start && !active) {
     active := True
     nextAddr := io.cfgBase
+    stride := io.cfgStride
     remaining := io.cfgCount
     outstanding := 0
     errorReg := False
@@ -62,21 +64,26 @@ case class ReadEngine(
 
   rb.io.allocValid := io.rdReqValid && io.rdReqReady
 
-  when(io.rdReqValid && io.rdReqReady) {
-    nextAddr := nextAddr + io.cfgStride
+  val issuing = io.rdReqValid && io.rdReqReady
+  val retiring = io.rdRspValid && io.rdRspReady
+
+  when(issuing) {
+    nextAddr := nextAddr + stride
     remaining := remaining - 1
+  }
+
+  when(issuing && !retiring) {
     outstanding := outstanding + 1
+  } elsewhen(!issuing && retiring && (outstanding =/= 0)) {
+    outstanding := outstanding - 1
   }
 
   io.rdRspReady := True
-  rb.io.wrValid := io.rdRspValid && io.rdRspReady
+  rb.io.wrValid := retiring
   rb.io.wrTag := io.rdRspTag
   rb.io.wrData := io.rdRspData
 
-  when(io.rdRspValid && io.rdRspReady) {
-    when(outstanding =/= 0) {
-      outstanding := outstanding - 1
-    }
+  when(retiring) {
     when(io.rdRspErr) {
       errorReg := True
     }

@@ -4,8 +4,8 @@ import spinal.core._
 import spinal.lib._
 
 object CmdErrorCode {
-  val None = B(0x00, 8 bits)
-  val Invalid = B(0x01, 8 bits)
+  def none: Bits = B(0x00, 8 bits)
+  def invalid: Bits = B(0x01, 8 bits)
 }
 
 case class CmdFrontend(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) extends Component {
@@ -76,7 +76,7 @@ case class CmdFrontend(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
 
   val rejPending = Reg(Bool()) init (False)
   val rejCmdIdReg = Reg(UInt(16 bits)) init (0)
-  val rejErrReg = Reg(Bits(8 bits)) init (CmdErrorCode.None)
+  val rejErrReg = Reg(Bits(8 bits)) init (CmdErrorCode.none)
 
   val canAcceptReject = !rejPending || io.rejReady
 
@@ -92,10 +92,10 @@ case class CmdFrontend(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) exten
   when(io.cmdValid && io.cmdReady && !isValidDesc) {
     rejPending := True
     rejCmdIdReg := io.cmdDesc.cmdId
-    rejErrReg := CmdErrorCode.Invalid
+    rejErrReg := CmdErrorCode.invalid
   } elsewhen(rejPending && io.rejReady) {
     rejPending := False
-    rejErrReg := CmdErrorCode.None
+    rejErrReg := CmdErrorCode.none
   }
 
   io.rejValid := rejPending

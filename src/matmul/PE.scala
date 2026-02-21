@@ -73,6 +73,7 @@ case class PE(lMul: Int = 4, lAdd: Int = 4) extends Component {
       bank0Shadow := B(0, 32 bits)
     }
   } otherwise {
+    // Speculative running sum used for throughput-1 accumulation.
     when(mulPipe.io.validOut) {
       when(bankSelMul) {
         bank1Shadow := Fp32Math.add(bank1Shadow, mulPipe.io.result)
@@ -81,13 +82,12 @@ case class PE(lMul: Int = 4, lAdd: Int = 4) extends Component {
       }
     }
 
+    // Committed/drain-visible bank value follows pipelined adder output.
     when(addPipe.io.validOut) {
       when(bankSelAdd) {
         bank1 := addPipe.io.result
-        bank1Shadow := addPipe.io.result
       } otherwise {
         bank0 := addPipe.io.result
-        bank0Shadow := addPipe.io.result
       }
     }
   }
