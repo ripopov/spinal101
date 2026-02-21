@@ -84,13 +84,17 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val tileScheduler = TileScheduler(cfg)
   val readEngineA = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd)
   val readEngineB = ReadEngine(cfg.addrBits, cfg.clBits, cfg.maxOutstandingRd)
-  val transposeBuffer = TransposeBuffer(cfg.s)
   val systolicCore = SystolicCore(cfg.s, cfg.lMul, cfg.lAdd)
   val drainPacker = DrainPacker(cfg)
   val statusGen = StatusGen(cfg)
 
-  // B feed FIFO: holds S CLs between ReadEngine output and systolic feed
-  val bFifo = StreamFifo(Bits(cfg.clBits bits), cfg.s + 2)
+  // A ping-pong staging buffers (each bank stores one SxS tile as rows).
+  val aStageBank0 = Vec(Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s), cfg.s)
+  val aStageBank1 = Vec(Vec(Reg(Bits(32 bits)) init (B(0, 32 bits)), cfg.s), cfg.s)
+
+  // B ping-pong staging buffers (one S-CL tile per bank).
+  val bStageBank0 = Vec(Reg(Bits(cfg.clBits bits)) init (B(0, cfg.clBits bits)), cfg.s)
+  val bStageBank1 = Vec(Reg(Bits(cfg.clBits bits)) init (B(0, cfg.clBits bits)), cfg.s)
 
   // Output FIFO between DrainPacker and d_wr_* ports
   val outFifo = StreamFifo(DWriteEntry(cfg), cfg.outFifoDepthCl)
@@ -187,6 +191,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val cmdDispatchQ = StreamFifo(DispatchCmdCtx(cfg), cfg.cmdqDepth)
   val stepIssueQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
   val injectQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
+  val injectBankQ = StreamFifo(Bool(), ctrlFifoDepth)
   val drainQ = StreamFifo(StepCtx(cfg), ctrlFifoDepth)
 
   object PrefetchState extends SpinalEnum {
@@ -207,9 +212,13 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val prefetchCtx = Reg(StepCtx(cfg))
   val injectCtx = Reg(StepCtx(cfg))
   val drainCtx = Reg(StepCtx(cfg))
+  val prefetchStageBank = Reg(Bool()) init (False)
+  val injectStageBank = Reg(Bool()) init (False)
+  val nextPrefetchBank = Reg(Bool()) init (False)
+  val stageBankValid0 = Reg(Bool()) init (False)
+  val stageBankValid1 = Reg(Bool()) init (False)
 
   val schedCmdActive = Reg(Bool()) init (False)
-  val schedStepWaitingDone = Reg(Bool()) init (False)
   val schedAbort = Reg(Bool()) init (False)
   val errorDetected = Reg(Bool()) init (False)
   val errorCmdId = Reg(UInt(16 bits)) init (0)
@@ -329,6 +338,10 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   injectQ.io.push.payload := prefetchCtx
   injectQ.io.pop.ready := False
 
+  injectBankQ.io.push.valid := False
+  injectBankQ.io.push.payload := prefetchStageBank
+  injectBankQ.io.pop.ready := False
+
   drainQ.io.push.valid := False
   drainQ.io.push.payload := injectCtx
   drainQ.io.pop.ready := False
@@ -350,29 +363,22 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   readEngineB.io.cfgStride := 0
   readEngineB.io.cfgCount := 0
 
-  // ReadEngine A -> TransposeBuffer
+  // ReadEngine A -> A ping-pong staging
   readEngineA.io.outReady := False
-  transposeBuffer.io.wrValid := False
-  transposeBuffer.io.wrRowIdx := aLoadCnt.resized
-  for (e <- 0 until cfg.s) {
-    transposeBuffer.io.wrData(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
-  }
-  transposeBuffer.io.swap := False
-  transposeBuffer.io.rdColIdx := feedCnt
 
-  // ReadEngine B -> B FIFO
-  readEngineB.io.outReady := bFifo.io.push.ready
-  bFifo.io.push.valid := readEngineB.io.outValid
-  bFifo.io.push.payload := readEngineB.io.outData
-
-  // B FIFO -> SystolicCore (default: not popping)
-  bFifo.io.pop.ready := False
+  // ReadEngine B -> B ping-pong staging
+  readEngineB.io.outReady := False
 
   // SystolicCore defaults
+  val aFeedCol = Vec(Bits(32 bits), cfg.s)
   for (i <- 0 until cfg.s) {
-    systolicCore.io.aIn(i) := transposeBuffer.io.rdData(i)
+    aFeedCol(i) := Mux(injectStageBank, aStageBank1(i)(feedCnt), aStageBank0(i)(feedCnt))
+  }
+  val bFeedLine = Mux(injectStageBank, bStageBank1(feedCnt), bStageBank0(feedCnt))
+  for (i <- 0 until cfg.s) {
+    systolicCore.io.aIn(i) := aFeedCol(i)
     systolicCore.io.aValid(i) := False
-    systolicCore.io.bIn(i) := bFifo.io.pop.payload((i + 1) * 32 - 1 downto i * 32)
+    systolicCore.io.bIn(i) := bFeedLine((i + 1) * 32 - 1 downto i * 32)
     systolicCore.io.bValid(i) := False
   }
   systolicCore.io.bankSel := coreBankSel
@@ -447,14 +453,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     traceCmdAccepted := True
   }
 
-  val stepDoneInjectPulse = Bool()
-  val stepDoneDrainPulse = Bool()
-  val stepDoneErrorPulse = Bool()
-  stepDoneInjectPulse := False
-  stepDoneDrainPulse := False
-  stepDoneErrorPulse := False
-  val stepDonePulse = stepDoneInjectPulse || stepDoneDrainPulse || stepDoneErrorPulse
-
   // ---------- Step generation engine ----------
 
   val emittedStep = StepCtx(cfg)
@@ -476,14 +474,27 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   emittedStep.bankSel := tileScheduler.io.bankSel
   stepIssueQ.io.push.payload := emittedStep
 
-  when(!schedCmdActive && !schedAbort) {
+  val cmdPipelineIdleForDispatch =
+    !schedCmdActive &&
+      (prefetchState === PrefetchState.IDLE) &&
+      (injectState === InjectState.IDLE) &&
+      (drainState === DrainState.IDLE) &&
+      !stepIssueQ.io.pop.valid &&
+      !injectQ.io.pop.valid &&
+      !injectBankQ.io.pop.valid &&
+      !drainQ.io.pop.valid &&
+      !stageBankValid0 &&
+      !stageBankValid1 &&
+      !readEngineA.io.busy &&
+      !readEngineB.io.busy
+
+  when(cmdPipelineIdleForDispatch && !schedAbort) {
     tileScheduler.io.cmdValid := cmdDispatchQ.io.pop.valid
     tileScheduler.io.cmdDesc := cmdDispatchQ.io.pop.payload.cmdDesc
     cmdDispatchQ.io.pop.ready := tileScheduler.io.cmdReady
     when(cmdDispatchQ.io.pop.fire) {
       schedCmdCtx := cmdDispatchQ.io.pop.payload
       schedCmdActive := True
-      schedStepWaitingDone := False
       errorDetected := False
     }
   } elsewhen (schedAbort) {
@@ -493,31 +504,32 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     } elsewhen (!tileScheduler.io.busy) {
       schedAbort := False
       schedCmdActive := False
-      schedStepWaitingDone := False
     }
-  } otherwise {
-    when(!schedStepWaitingDone && tileScheduler.io.stepValid && stepIssueQ.io.push.ready) {
+  } elsewhen (schedCmdActive) {
+    when(tileScheduler.io.stepValid && stepIssueQ.io.push.ready) {
       stepIssueQ.io.push.valid := True
-      schedStepWaitingDone := True
-    }
-
-    when(schedStepWaitingDone && stepDonePulse) {
       tileScheduler.io.stepReady := True
-      schedStepWaitingDone := False
-    }
-
-    when(!tileScheduler.io.busy && !schedStepWaitingDone) {
-      schedCmdActive := False
     }
   }
 
+  when(dWriteLastFire && schedCmdActive && (io.d_wr_cmd_id === schedCmdCtx.cmdDesc.cmdId)) {
+    schedCmdActive := False
+  }
+
   // ---------- Prefetch/issue engine ----------
+
+  val stageBank0Free = !stageBankValid0
+  val stageBank1Free = !stageBankValid1
+  val prefetchTargetBank = Bool()
+  prefetchTargetBank := Mux(stageBank0Free && stageBank1Free, nextPrefetchBank, Mux(stageBank1Free, True, False))
+  val prefetchBankFree = Bool()
+  prefetchBankFree := stageBank0Free || stageBank1Free
 
   switch(prefetchState) {
     is(PrefetchState.IDLE) {
       when(schedAbort) {
         stepIssueQ.io.pop.ready := stepIssueQ.io.pop.valid
-      } elsewhen(stepIssueQ.io.pop.valid) {
+      } elsewhen(stepIssueQ.io.pop.valid && prefetchBankFree) {
         stepIssueQ.io.pop.ready := True
         prefetchCtx := stepIssueQ.io.pop.payload
         prefetchState := PrefetchState.START_READS
@@ -534,6 +546,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       readEngineB.io.cfgCount := U(cfg.s, 16 bits)
 
       when(!readEngineA.io.busy && !readEngineB.io.busy) {
+        prefetchStageBank := prefetchTargetBank
         readEngineA.io.start := True
         readEngineB.io.start := True
         aLoadCnt := 0
@@ -545,12 +558,23 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     is(PrefetchState.LOAD_AB) {
       when(readEngineA.io.outValid && (aLoadCnt < U(cfg.s, aLoadCnt.getWidth bits))) {
         readEngineA.io.outReady := True
-        transposeBuffer.io.wrValid := True
-        transposeBuffer.io.wrRowIdx := aLoadCnt.resized
+        for (e <- 0 until cfg.s) {
+          when(prefetchStageBank) {
+            aStageBank1(aLoadCnt.resized)(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
+          } otherwise {
+            aStageBank0(aLoadCnt.resized)(e) := readEngineA.io.outData((e + 1) * 32 - 1 downto e * 32)
+          }
+        }
         aLoadCnt := aLoadCnt + 1
       }
 
-      when(readEngineB.io.outValid && bFifo.io.push.ready) {
+      when(readEngineB.io.outValid && (bLoadCnt < U(cfg.s, bLoadCnt.getWidth bits))) {
+        readEngineB.io.outReady := True
+        when(prefetchStageBank) {
+          bStageBank1(bLoadCnt.resized) := readEngineB.io.outData
+        } otherwise {
+          bStageBank0(bLoadCnt.resized) := readEngineB.io.outData
+        }
         bLoadCnt := bLoadCnt + 1
       }
 
@@ -568,9 +592,18 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     }
 
     is(PrefetchState.ENQ_INJECT) {
-      injectQ.io.push.valid := True
+      val canEnqueueInject = injectQ.io.push.ready && injectBankQ.io.push.ready
+      injectQ.io.push.valid := canEnqueueInject
       injectQ.io.push.payload := prefetchCtx
-      when(injectQ.io.push.ready) {
+      injectBankQ.io.push.valid := canEnqueueInject
+      injectBankQ.io.push.payload := prefetchStageBank
+      when(canEnqueueInject) {
+        when(prefetchStageBank) {
+          stageBankValid1 := True
+        } otherwise {
+          stageBankValid0 := True
+        }
+        nextPrefetchBank := !prefetchStageBank
         prefetchState := PrefetchState.IDLE
       }
     }
@@ -578,7 +611,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     is(PrefetchState.ERROR_DRAIN) {
       readEngineA.io.outReady := True
       readEngineB.io.outReady := True
-      bFifo.io.pop.ready := bFifo.io.pop.valid
       when(!readEngineA.io.busy && !readEngineB.io.busy) {
         prefetchState := PrefetchState.ERROR_STATUS
       }
@@ -588,7 +620,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       statusGen.io.errValid := True
       statusGen.io.errCmdId := errorCmdId
       statusGen.io.errCode := B(0x02, 8 bits)
-      stepDoneErrorPulse := True
       schedAbort := True
       bank0ComputeBusy := False
       bank1ComputeBusy := False
@@ -596,6 +627,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       bank1DrainBusy := False
       bank0RowBusy := 0
       bank1RowBusy := 0
+      stageBankValid0 := False
+      stageBankValid1 := False
       injectState := InjectState.IDLE
       drainState := DrainState.IDLE
       prefetchState := PrefetchState.IDLE
@@ -614,13 +647,28 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     }
   }
 
+  val injectStageReady = Bool()
+  injectStageReady := False
+  when(injectBankQ.io.pop.valid) {
+    injectStageReady := Mux(injectBankQ.io.pop.payload, stageBankValid1, stageBankValid0)
+  }
+
   switch(injectState) {
     is(InjectState.IDLE) {
       when(schedAbort) {
-        injectQ.io.pop.ready := injectQ.io.pop.valid
-      } elsewhen(injectQ.io.pop.valid && !bankHazardForInject) {
+        val canDropInject = injectQ.io.pop.valid && injectBankQ.io.pop.valid
+        injectQ.io.pop.ready := canDropInject
+        injectBankQ.io.pop.ready := canDropInject
+      } elsewhen(
+        injectQ.io.pop.valid &&
+          injectBankQ.io.pop.valid &&
+          !bankHazardForInject &&
+          injectStageReady
+      ) {
         injectQ.io.pop.ready := True
+        injectBankQ.io.pop.ready := True
         injectCtx := injectQ.io.pop.payload
+        injectStageBank := injectBankQ.io.pop.payload
         coreBankSel := injectQ.io.pop.payload.bankSel
         when(injectQ.io.pop.payload.bankSel) {
           bank1ComputeBusy := True
@@ -628,24 +676,22 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
           bank0ComputeBusy := True
         }
         feedCnt := 0
-        injectState := InjectState.SWAP_TB
+        traceFeedStart := True
+        injectState := InjectState.FEED
       }
     }
 
     is(InjectState.SWAP_TB) {
-      transposeBuffer.io.swap := True
       traceFeedStart := True
       feedCnt := 0
       injectState := InjectState.FEED
     }
 
     is(InjectState.FEED) {
-      transposeBuffer.io.rdColIdx := feedCnt
-      bFifo.io.pop.ready := True
       for (i <- 0 until cfg.s) {
-        systolicCore.io.aIn(i) := transposeBuffer.io.rdData(i)
+        systolicCore.io.aIn(i) := aFeedCol(i)
         systolicCore.io.aValid(i) := True
-        systolicCore.io.bIn(i) := bFifo.io.pop.payload((i + 1) * 32 - 1 downto i * 32)
+        systolicCore.io.bIn(i) := bFeedLine((i + 1) * 32 - 1 downto i * 32)
         systolicCore.io.bValid(i) := True
       }
       when(feedCnt === 0 && injectCtx.clearBank) {
@@ -653,11 +699,15 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       }
 
       when(feedCnt === U(cfg.s - 1, feedCnt.getWidth bits)) {
+        when(injectStageBank) {
+          stageBankValid1 := False
+        } otherwise {
+          stageBankValid0 := False
+        }
         when(injectCtx.drainTrigger) {
           tailCnt := 0
           injectState := InjectState.TAIL
         } otherwise {
-          stepDoneInjectPulse := True
           when(injectCtx.bankSel) {
             bank1ComputeBusy := False
           } otherwise {
@@ -688,8 +738,12 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       when(drainQ.io.push.ready) {
         when(injectCtx.bankSel) {
           bank1ComputeBusy := False
+          bank1DrainBusy := True
+          bank1RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
         } otherwise {
           bank0ComputeBusy := False
+          bank0DrainBusy := True
+          bank0RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
         }
         injectState := InjectState.IDLE
       }
@@ -720,13 +774,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       } elsewhen(drainQ.io.pop.valid) {
         drainQ.io.pop.ready := True
         drainCtx := drainQ.io.pop.payload
-        when(drainQ.io.pop.payload.bankSel) {
-          bank1DrainBusy := True
-          bank1RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
-        } otherwise {
-          bank0DrainBusy := True
-          bank0RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
-        }
         drainState := DrainState.DRAIN_START
       }
     }
@@ -762,7 +809,6 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     }
 
     is(DrainState.STEP_DONE) {
-      stepDoneDrainPulse := True
       when(drainCtx.bankSel) {
         bank1DrainBusy := False
         bank1RowBusy := 0
@@ -779,7 +825,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val aLoadDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
   val bLoadDone = bLoadCnt === U(cfg.s, bLoadCnt.getWidth bits)
 
-  utilInjectFullCycle := (injectState === InjectState.FEED) && bFifo.io.pop.valid
+  utilInjectFullCycle := injectState === InjectState.FEED
   utilStallSample := utilInjectWindowActive && !utilInjectFullCycle
 
   utilStallCauseNoStep := False
@@ -845,13 +891,17 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val cmdPipelineQuiescent =
     !schedCmdActive &&
       !tileScheduler.io.busy &&
-      !schedStepWaitingDone &&
       (prefetchState === PrefetchState.IDLE) &&
       (injectState === InjectState.IDLE) &&
       (drainState === DrainState.IDLE) &&
       !stepIssueQ.io.pop.valid &&
       !injectQ.io.pop.valid &&
-      !drainQ.io.pop.valid
+      !injectBankQ.io.pop.valid &&
+      !drainQ.io.pop.valid &&
+      !stageBankValid0 &&
+      !stageBankValid1 &&
+      !readEngineA.io.busy &&
+      !readEngineB.io.busy
 
   when(cmdPipelineQuiescent || (prefetchState === PrefetchState.ERROR_STATUS)) {
     utilInjectWindowActive := False

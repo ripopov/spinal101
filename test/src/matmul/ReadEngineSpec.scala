@@ -67,4 +67,81 @@ class ReadEngineSpec extends AnyFunSuite {
         assert(out.toSeq == Seq(BigInt(1), BigInt(2), BigInt(3), BigInt(4)))
       }
   }
+
+  test("ReadEngine accepts a queued descriptor while current transfer is active") {
+    SpinalSimConfig().withVerilator.compile(ReadEngine(addrBits = 64, clBits = 128, maxOutstandingRd = 4)).doSim(
+      "read_engine_queued"
+    ) { dut =>
+      dut.clockDomain.forkStimulus(2)
+
+      dut.io.start #= false
+      dut.io.cfgBase #= 0
+      dut.io.cfgStride #= 16
+      dut.io.cfgCount #= 0
+
+      dut.io.rdReqReady #= true
+      dut.io.rdRspValid #= false
+      dut.io.rdRspData #= 0
+      dut.io.rdRspTag #= 0
+      dut.io.rdRspErr #= false
+      dut.io.outReady #= true
+
+      val reqAddrs = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      val outData = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+      val rspQ = scala.collection.mutable.Queue.empty[(Int, BigInt)]
+      var nextData = 1
+
+      fork {
+        while (true) {
+          dut.clockDomain.waitSampling()
+
+          if (dut.io.rdReqValid.toBoolean && dut.io.rdReqReady.toBoolean) {
+            reqAddrs += dut.io.rdReqAddr.toBigInt
+            rspQ.enqueue((dut.io.rdReqTag.toBigInt.intValue, BigInt(nextData)))
+            nextData += 1
+          }
+
+          if (rspQ.nonEmpty) {
+            val (tag, data) = rspQ.dequeue()
+            dut.io.rdRspTag #= tag
+            dut.io.rdRspData #= data
+            dut.io.rdRspErr #= false
+            dut.io.rdRspValid #= true
+          } else {
+            dut.io.rdRspValid #= false
+          }
+
+          if (dut.io.outValid.toBoolean && dut.io.outReady.toBoolean) {
+            outData += dut.io.outData.toBigInt
+          }
+        }
+      }
+
+      dut.io.cfgBase #= BigInt(0x1000)
+      dut.io.cfgStride #= 16
+      dut.io.cfgCount #= 2
+      dut.io.start #= true
+      dut.clockDomain.waitSampling()
+      dut.io.start #= false
+
+      dut.clockDomain.waitSampling()
+      assert(dut.io.cfgReady.toBoolean, "queued descriptor slot should be available")
+      dut.io.cfgBase #= BigInt(0x2000)
+      dut.io.cfgStride #= 16
+      dut.io.cfgCount #= 2
+      dut.io.start #= true
+      dut.clockDomain.waitSampling()
+      dut.io.start #= false
+
+      var cycles = 0
+      while (outData.size < 4 && cycles < 80) {
+        dut.clockDomain.waitSampling()
+        cycles += 1
+      }
+
+      assert(outData.size == 4, s"expected 4 outputs, got ${outData.size}")
+      assert(reqAddrs.toSeq == Seq(BigInt(0x1000), BigInt(0x1010), BigInt(0x2000), BigInt(0x2010)))
+      assert(outData.toSeq == Seq(BigInt(1), BigInt(2), BigInt(3), BigInt(4)))
+    }
+  }
 }

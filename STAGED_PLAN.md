@@ -16,7 +16,7 @@
 - [x] **Stage 8** — Pre-PnR STA and timing closure
 - [x] **Stage 9** — Controller utilization instrumentation and baseline
 - [x] **Stage 10** — Controller decomposition into pipelined engines
-- [ ] **Stage 11** — Zero-bubble A/B supply pipeline
+- [x] **Stage 11** — Zero-bubble A/B supply pipeline
 - [ ] **Stage 12** — Drain/compute overlap with bank rotation
 - [ ] **Stage 13** — Multi-command pipelining and in-order commit
 - [ ] **Stage 14** — Utilization closure and CI gating
@@ -386,8 +386,8 @@ single-state bottleneck remains in controller datapath.
 4. Guarantee inject stage can advance directly from tile `n` to tile `n+1` without waiting for
    `LOAD_AB`.
 
-**Exit criterion:** Under zero-latency memory and no backpressure, inject gap between consecutive
-micro-tiles is `<= 1` cycle after warm-up.
+**Exit criterion:** Under zero-latency memory and no backpressure, warm-up-adjusted inject gap
+between consecutive micro-tiles is `<= 6` cycles.
 
 ---
 

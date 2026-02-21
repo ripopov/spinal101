@@ -156,11 +156,13 @@ class PerfSpec extends AnyFunSuite {
       )
     ) { (dut, tb) =>
       val reqIssueCycles = mutable.ArrayBuffer.empty[Long]
+      val injectFullCycles = mutable.ArrayBuffer.empty[Long]
       fork {
         var cycle = 0L
         while (true) {
           val aFire = dut.io.a_rd_req_valid.toBoolean && dut.io.a_rd_req_ready.toBoolean
           if (aFire) reqIssueCycles += cycle
+          if (dut.utilInjectFullCycle.toBoolean) injectFullCycles += cycle
           dut.clockDomain.waitSampling()
           cycle += 1
         }
@@ -173,35 +175,43 @@ class PerfSpec extends AnyFunSuite {
         dBase = 0x600000,
         m = s,
         n = s,
-        k = 2 * s,
-        lda = 2 * s,
+        k = 4 * s,
+        lda = 4 * s,
         ldb = s,
         ldd = s,
         primM = s,
         primN = s,
-        primK = 2 * s
+        primK = 4 * s
       )
 
       val a = mkRows(cmd.m, cmd.k, cmd.lda, seed = 30 + s)
       val b = mkRows(cmd.k, cmd.n, cmd.ldb, seed = 40 + s)
       assert(tb.runCommand(cmd, a, b).isInstanceOf[CommandSuccess], s"overlap command failed for S=$s")
 
-      val windows = injectWindows(reqIssueCycles.toSeq)
-      assert(windows.length >= 2, s"expected at least two inject windows for S=$s")
+      val injectWindowsObserved = injectWindows(injectFullCycles.toSeq)
+      assert(injectWindowsObserved.length >= 4, s"expected at least four inject windows for S=$s")
+      val injectLens = injectWindowsObserved.map { case (s0, e0) => (e0 - s0 + 1).toInt }
+      assert(injectLens.forall(_ > 0), s"invalid inject window lengths for S=$s")
+      val injectGaps = injectWindowsObserved.sliding(2).map { case Seq(w0, w1) => (w1._1 - w0._2 - 1).toInt }.toSeq
+      val maxWarmupInjectGap =
+        if (injectGaps.length > 1) injectGaps.drop(1).max
+        else injectGaps.headOption.getOrElse(0)
 
-      val firstLen = (windows.head._2 - windows.head._1 + 1).toInt
-      val secondLen = (windows(1)._2 - windows(1)._1 + 1).toInt
-      val gap = (windows(1)._1 - windows.head._2 - 1).toInt
+      val reqWindows = injectWindows(reqIssueCycles.toSeq)
+      val reqGaps = reqWindows.sliding(2).map { case Seq(w0, w1) => (w1._1 - w0._2 - 1).toInt }.toSeq
+      val maxWarmupReqGap =
+        if (reqGaps.length > 1) reqGaps.drop(1).max
+        else reqGaps.headOption.getOrElse(-1)
 
-      assert(firstLen > 0, s"invalid first inject window length for S=$s")
-      assert(secondLen > 0, s"invalid second inject window length for S=$s")
-      val overlapGapBudget = s + 14
-      assert(
-        gap <= overlapGapBudget,
-        s"excessive primitive gap for S=$s: gap=$gap budget=$overlapGapBudget"
+      info(
+        s"[perf S=$s overlap] windows=${injectWindowsObserved.length} firstLen=${injectLens.head} " +
+          s"maxWarmupInjectGap=$maxWarmupInjectGap maxWarmupReqGap=$maxWarmupReqGap"
       )
-
-      info(s"[perf S=$s overlap] firstLen=$firstLen secondLen=$secondLen reqGap=$gap")
+      val overlapGapBudget = 6
+      assert(
+        maxWarmupInjectGap <= overlapGapBudget,
+        s"excessive warm-up-adjusted inject gap for S=$s: gap=$maxWarmupInjectGap budget=$overlapGapBudget"
+      )
     }
 
     runCase(

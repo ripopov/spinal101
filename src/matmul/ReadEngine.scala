@@ -16,6 +16,7 @@ case class ReadEngine(
     val cfgBase = in UInt(addrBits bits)
     val cfgStride = in UInt(addrBits bits)
     val cfgCount = in UInt(16 bits)
+    val cfgReady = out Bool()
 
     val busy = out Bool()
     val error = out Bool()
@@ -46,14 +47,27 @@ case class ReadEngine(
   val remaining = Reg(UInt(16 bits)) init (0)
   val outstanding = Reg(UInt(log2Up(maxOutstandingRd + 1) bits)) init (0)
   val errorReg = Reg(Bool()) init (False)
+  val pendingValid = Reg(Bool()) init (False)
+  val pendingBase = Reg(UInt(addrBits bits)) init (0)
+  val pendingStride = Reg(UInt(addrBits bits)) init (0)
+  val pendingCount = Reg(UInt(16 bits)) init (0)
 
-  when(io.start && !active) {
-    active := True
-    nextAddr := io.cfgBase
-    stride := io.cfgStride
-    remaining := io.cfgCount
-    outstanding := 0
-    errorReg := False
+  io.cfgReady := !pendingValid
+
+  when(io.start && io.cfgReady) {
+    when(!active) {
+      active := True
+      nextAddr := io.cfgBase
+      stride := io.cfgStride
+      remaining := io.cfgCount
+      outstanding := 0
+      errorReg := False
+    } otherwise {
+      pendingValid := True
+      pendingBase := io.cfgBase
+      pendingStride := io.cfgStride
+      pendingCount := io.cfgCount
+    }
   }
 
   val canIssue = active && (remaining =/= 0) && rb.io.allocReady && (outstanding =/= U(maxOutstandingRd, outstanding.getWidth bits))
@@ -93,11 +107,20 @@ case class ReadEngine(
   io.outData := rb.io.rdData
   rb.io.rdReady := io.outReady
 
-  when(active && (remaining === 0) && (outstanding === 0) && (rb.io.entriesUsed === 0)) {
-    active := False
+  when(active && (remaining === 0) && (outstanding === 0)) {
+    when(pendingValid) {
+      nextAddr := pendingBase
+      stride := pendingStride
+      remaining := pendingCount
+      outstanding := 0
+      errorReg := False
+      pendingValid := False
+    } otherwise {
+      active := False
+    }
   }
 
-  io.busy := active
+  io.busy := active || pendingValid
   io.error := errorReg
   io.outstanding := outstanding
 }
