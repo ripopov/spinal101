@@ -70,16 +70,7 @@ read_liberty $liberty
 read_verilog $synth_netlist
 link_design $DESIGN_NAME
 
-set sites [get_sites]
-if {[llength [get_sites unithd]] > 0} {
-  set floorplan_site unithd
-} elseif {[llength \$sites] > 0} {
-  set floorplan_site [lindex \$sites 0]
-} else {
-  puts stderr "No placement site available in loaded LEFs."
-  exit 1
-}
-initialize_floorplan -site \$floorplan_site -die_area {0 0 500 500} -core_area {10 10 490 490}
+initialize_floorplan -site unithd -die_area {0 0 500 500} -core_area {10 10 490 490}
 write_def $def_file
 
 create_clock -name core_clk -period $TARGET_PERIOD_NS [get_ports $CLOCK_PORT]
