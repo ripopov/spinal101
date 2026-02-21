@@ -1,6 +1,7 @@
 package matmul
 
 import spinal.core._
+import spinal.core.sim._
 import spinal.lib._
 
 case class SystolicMatmulConfig(
@@ -230,6 +231,86 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   // Track whether this is the last step of the scheduler
   val lastPkForMiNj = Reg(Bool()) init (False)
 
+  // ---------- Utilization/Trace Instrumentation (simulation-visible) ----------
+
+  val utilTotalCycles = Reg(UInt(64 bits)) init (0)
+  val utilInjectWindowCycles = Reg(UInt(64 bits)) init (0)
+  val utilInjectFullCycles = Reg(UInt(64 bits)) init (0)
+
+  val utilStallNoStepCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallANotReadyCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallBNotReadyCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallBankHazardCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallDrainBlockedCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallOutputBackpressureCycles = Reg(UInt(64 bits)) init (0)
+  val utilStallErrorFlushCycles = Reg(UInt(64 bits)) init (0)
+
+  val utilInjectWindowActive = Reg(Bool()) init (False)
+  val utilInjectFullCycle = Bool()
+  val utilStallSample = Bool()
+
+  val utilStallCauseNoStep = Bool()
+  val utilStallCauseANotReady = Bool()
+  val utilStallCauseBNotReady = Bool()
+  val utilStallCauseBankHazard = Bool()
+  val utilStallCauseDrainBlocked = Bool()
+  val utilStallCauseOutputBackpressure = Bool()
+  val utilStallCauseErrorFlush = Bool()
+
+  val traceCmdAccepted = Bool()
+  val traceFeedStart = Bool()
+  val traceDrainStart = Bool()
+  val traceDrainDone = Bool()
+
+  val traceCmdAcceptedCount = Reg(UInt(32 bits)) init (0)
+  val traceFeedStartCount = Reg(UInt(32 bits)) init (0)
+  val traceDrainStartCount = Reg(UInt(32 bits)) init (0)
+  val traceDrainDoneCount = Reg(UInt(32 bits)) init (0)
+
+  val traceLastCmdAcceptedCycle = Reg(UInt(64 bits)) init (0)
+  val traceLastFeedStartCycle = Reg(UInt(64 bits)) init (0)
+  val traceLastDrainStartCycle = Reg(UInt(64 bits)) init (0)
+  val traceLastDrainDoneCycle = Reg(UInt(64 bits)) init (0)
+
+  utilTotalCycles.simPublic()
+  utilInjectWindowCycles.simPublic()
+  utilInjectFullCycles.simPublic()
+
+  utilStallNoStepCycles.simPublic()
+  utilStallANotReadyCycles.simPublic()
+  utilStallBNotReadyCycles.simPublic()
+  utilStallBankHazardCycles.simPublic()
+  utilStallDrainBlockedCycles.simPublic()
+  utilStallOutputBackpressureCycles.simPublic()
+  utilStallErrorFlushCycles.simPublic()
+
+  utilInjectWindowActive.simPublic()
+  utilInjectFullCycle.simPublic()
+  utilStallSample.simPublic()
+
+  utilStallCauseNoStep.simPublic()
+  utilStallCauseANotReady.simPublic()
+  utilStallCauseBNotReady.simPublic()
+  utilStallCauseBankHazard.simPublic()
+  utilStallCauseDrainBlocked.simPublic()
+  utilStallCauseOutputBackpressure.simPublic()
+  utilStallCauseErrorFlush.simPublic()
+
+  traceCmdAccepted.simPublic()
+  traceFeedStart.simPublic()
+  traceDrainStart.simPublic()
+  traceDrainDone.simPublic()
+
+  traceCmdAcceptedCount.simPublic()
+  traceFeedStartCount.simPublic()
+  traceDrainStartCount.simPublic()
+  traceDrainDoneCount.simPublic()
+
+  traceLastCmdAcceptedCycle.simPublic()
+  traceLastFeedStartCycle.simPublic()
+  traceLastDrainStartCycle.simPublic()
+  traceLastDrainDoneCycle.simPublic()
+
   // ---------- Default assignments ----------
 
   // TileScheduler
@@ -300,6 +381,11 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   statusGen.io.errCmdId := errorCmdId
   statusGen.io.errCode := B(0x02, 8 bits) // readErr
 
+  traceCmdAccepted := False
+  traceFeedStart := False
+  traceDrainStart := False
+  traceDrainDone := False
+
   // ---------- Address computation ----------
 
   val sWide = U(cfg.s, cfg.addrBits bits)
@@ -328,6 +414,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     is(FeedState.IDLE) {
       when(cmdFrontend.io.outValid && !cmdActive) {
         cmdFrontend.io.outReady := True
+        traceCmdAccepted := True
         curCmd := cmdFrontend.io.outDesc
         numPi := cmdFrontend.io.outDesc.m / cmdFrontend.io.outDesc.primM
         numPj := cmdFrontend.io.outDesc.n / cmdFrontend.io.outDesc.primN
@@ -418,6 +505,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
     is(FeedState.SWAP_TB) {
       transposeBuffer.io.swap := True
+      traceFeedStart := True
       feedCnt := 0
       feedState := FeedState.FEED
     }
@@ -470,12 +558,14 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
     is(FeedState.DRAIN_START) {
       // One-cycle pulse to start drain
+      traceDrainStart := True
       drainPacker.io.drainStart := True
       feedState := FeedState.DRAIN_WAIT
     }
 
     is(FeedState.DRAIN_WAIT) {
       when(drainPacker.io.drainDone) {
+        traceDrainDone := True
         val lastMiNj = (stepMi === numMi - 1) && (stepNj === numNj - 1)
         val lastPkCmd = stepPkCmd === numPkCmd - 1
 
@@ -526,5 +616,104 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       cmdActive := False
       feedState := FeedState.IDLE
     }
+  }
+
+  // ---------- Utilization/Trace Counter Updates ----------
+
+  val aLoadDone = aLoadCnt === U(cfg.s, aLoadCnt.getWidth bits)
+  val bLoadDone = bLoadCnt === U(cfg.s, bLoadCnt.getWidth bits)
+
+  utilInjectFullCycle := (feedState === FeedState.FEED) && bFifo.io.pop.valid
+  utilStallSample := utilInjectWindowActive && !utilInjectFullCycle
+
+  utilStallCauseNoStep := False
+  utilStallCauseANotReady := False
+  utilStallCauseBNotReady := False
+  utilStallCauseBankHazard := False
+  utilStallCauseDrainBlocked := False
+  utilStallCauseOutputBackpressure := False
+  utilStallCauseErrorFlush := False
+
+  val stallErrorFlushCond =
+    (feedState === FeedState.ERROR_DRAIN) || (feedState === FeedState.ERROR_STATUS) || errorDetected
+  val stallOutputBackpressureCond =
+    (feedState === FeedState.DRAIN_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
+  val stallDrainBlockedCond =
+    (feedState === FeedState.TAIL) ||
+      (feedState === FeedState.DRAIN_START) ||
+      ((feedState === FeedState.DRAIN_WAIT) && !drainPacker.io.drainDone && !stallOutputBackpressureCond)
+  val stallBankHazardCond = (feedState === FeedState.FLUSH_START) || (feedState === FeedState.FLUSH_D)
+  val stallANotReadyCond = (feedState === FeedState.LOAD_AB) && !aLoadDone
+  val stallBNotReadyCond = (feedState === FeedState.LOAD_AB) && aLoadDone && !bLoadDone
+
+  when(utilStallSample) {
+    when(stallErrorFlushCond) {
+      utilStallCauseErrorFlush := True
+    } elsewhen (stallOutputBackpressureCond) {
+      utilStallCauseOutputBackpressure := True
+    } elsewhen (stallDrainBlockedCond) {
+      utilStallCauseDrainBlocked := True
+    } elsewhen (stallBankHazardCond) {
+      utilStallCauseBankHazard := True
+    } elsewhen (stallANotReadyCond) {
+      utilStallCauseANotReady := True
+    } elsewhen (stallBNotReadyCond) {
+      utilStallCauseBNotReady := True
+    } otherwise {
+      utilStallCauseNoStep := True
+    }
+  }
+
+  utilTotalCycles := utilTotalCycles + 1
+
+  when(traceCmdAccepted) {
+    traceCmdAcceptedCount := traceCmdAcceptedCount + 1
+    traceLastCmdAcceptedCycle := utilTotalCycles
+  }
+  when(traceFeedStart) {
+    traceFeedStartCount := traceFeedStartCount + 1
+    traceLastFeedStartCycle := utilTotalCycles
+    utilInjectWindowActive := True
+  }
+  when(traceDrainStart) {
+    traceDrainStartCount := traceDrainStartCount + 1
+    traceLastDrainStartCycle := utilTotalCycles
+  }
+  when(traceDrainDone) {
+    traceDrainDoneCount := traceDrainDoneCount + 1
+    traceLastDrainDoneCycle := utilTotalCycles
+  }
+
+  when((feedState === FeedState.CMD_DONE) || (feedState === FeedState.ERROR_STATUS)) {
+    utilInjectWindowActive := False
+  }
+
+  when(utilInjectWindowActive) {
+    utilInjectWindowCycles := utilInjectWindowCycles + 1
+  }
+  when(utilInjectFullCycle) {
+    utilInjectFullCycles := utilInjectFullCycles + 1
+  }
+
+  when(utilStallCauseNoStep) {
+    utilStallNoStepCycles := utilStallNoStepCycles + 1
+  }
+  when(utilStallCauseANotReady) {
+    utilStallANotReadyCycles := utilStallANotReadyCycles + 1
+  }
+  when(utilStallCauseBNotReady) {
+    utilStallBNotReadyCycles := utilStallBNotReadyCycles + 1
+  }
+  when(utilStallCauseBankHazard) {
+    utilStallBankHazardCycles := utilStallBankHazardCycles + 1
+  }
+  when(utilStallCauseDrainBlocked) {
+    utilStallDrainBlockedCycles := utilStallDrainBlockedCycles + 1
+  }
+  when(utilStallCauseOutputBackpressure) {
+    utilStallOutputBackpressureCycles := utilStallOutputBackpressureCycles + 1
+  }
+  when(utilStallCauseErrorFlush) {
+    utilStallErrorFlushCycles := utilStallErrorFlushCycles + 1
   }
 }

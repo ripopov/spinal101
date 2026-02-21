@@ -14,7 +14,7 @@
 - [x] **Stage 6** — RTL: Drain, output packer, status — full top-level integration
 - [x] **Stage 7** — Performance tests (throughput and overlap contracts)
 - [x] **Stage 8** — Pre-PnR STA and timing closure
-- [ ] **Stage 9** — Controller utilization instrumentation and baseline
+- [x] **Stage 9** — Controller utilization instrumentation and baseline
 - [ ] **Stage 10** — Controller decomposition into pipelined engines
 - [ ] **Stage 11** — Zero-bubble A/B supply pipeline
 - [ ] **Stage 12** — Drain/compute overlap with bank rotation
