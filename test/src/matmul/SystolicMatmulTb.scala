@@ -39,7 +39,7 @@ object SystolicMatmulTb {
   }
 
   def defaultHarnessConfigS16: HarnessConfig = {
-    val dutCfg = SystolicMatmulConfig()
+    val dutCfg = SystolicMatmulConfig(clBits = 512)
     HarnessConfig(
       dutCfg = dutCfg,
       memoryCfg = MemoryAgentConfig(clBytes = dutCfg.clBytes),

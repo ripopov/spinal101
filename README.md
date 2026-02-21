@@ -158,11 +158,14 @@ drainData[3] = PE(drainRow, 3).drain_data
 mill spinal101.compile
 mill spinal101.test
 
-# generate legacy baseline RTL (Fp32MatrixMul)
+# generate systolic RTL (default S=4)
 make rtl
 
-# generate systolic RTL (default S=16)
+# explicit alias for systolic RTL generation
 make rtl-systolic
+
+# generate legacy baseline RTL (Fp32MatrixMulV0, default S=2)
+make rtl-v0
 
 # explicitly choose systolic size for RTL generation
 make rtl-systolic SYSTOLIC_S=4

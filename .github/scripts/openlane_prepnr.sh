@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DESIGN_NAME="${DESIGN_NAME:-Fp32MatrixMul}"
-RTL_PATH="${RTL_PATH:-generated/Fp32MatrixMul.v}"
+DESIGN_NAME="${DESIGN_NAME:-SystolicMatmul}"
+RTL_PATH="${RTL_PATH:-generated/SystolicMatmul.v}"
 PDK_ROOT="${PDK_ROOT:?PDK_ROOT must point to a Volare PDK root}"
 PDK="${PDK:-sky130A}"
 SCL="${SCL:-sky130_fd_sc_hd}"

@@ -61,7 +61,7 @@ for a stage that does not pass its tests.
 - Avoid global hardware `val` definitions that can leak across elaborations; prefer methods for hardware literals/constants.
 - Build artifacts are ignored (`out/`, `generated/`, `simWorkspace/`).
 - Icarus backend is not enabled in tests in this environment; Verilator is the supported path.
-- Parameterize `S` in all new RTL modules (default 16, test with 4 for fast simulation).
+- Parameterize `S` in all new RTL modules (default 4, test with 16 for full-size validation).
 
 ## Current CI / OpenLane Status (2026-02-21 UTC)
 

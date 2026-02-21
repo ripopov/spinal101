@@ -227,7 +227,7 @@ object RefMatmul {
    * @param primM primitive M
    * @param primN primitive N
    * @param primK primitive K
-   * @param S    physical systolic dimension (default 16)
+   * @param S    physical systolic dimension (default 4)
    * @return D as flat Int array, M x ldd elements
    */
   def compute(
@@ -235,7 +235,7 @@ object RefMatmul {
       M: Int, N: Int, K: Int,
       lda: Int, ldb: Int, ldd: Int,
       primM: Int, primN: Int, primK: Int,
-      S: Int = 16
+      S: Int = 4
   ): Array[Int] = {
     val D = new Array[Int](M * ldd)
 

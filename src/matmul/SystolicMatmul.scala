@@ -5,7 +5,7 @@ import spinal.lib._
 
 case class SystolicMatmulConfig(
     addrBits: Int = 64,
-    clBits: Int = 512,
+    clBits: Int = 128,
     fpBits: Int = 32,
     maxOutstandingRd: Int = 16,
     cmdqDepth: Int = 4,

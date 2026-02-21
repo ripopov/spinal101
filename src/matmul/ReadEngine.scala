@@ -4,7 +4,7 @@ import spinal.core._
 
 case class ReadEngine(
     addrBits: Int = 64,
-    clBits: Int = 512,
+    clBits: Int = 128,
     maxOutstandingRd: Int = 16
 ) extends Component {
   require((maxOutstandingRd & (maxOutstandingRd - 1)) == 0, "maxOutstandingRd must be power of 2")
