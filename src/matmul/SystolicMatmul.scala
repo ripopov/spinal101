@@ -211,7 +211,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
     val IDLE, START_READS, LOAD_AB, ENQ_INJECT, ERROR_DRAIN, ERROR_STATUS = newElement()
   }
   object InjectState extends SpinalEnum {
-    val IDLE, FEED, ENQ_DRAIN = newElement()
+    val IDLE, FEED = newElement()
   }
   object DrainState extends SpinalEnum {
     val IDLE, LOAD_PENDING, WAIT_DELAY, DRAIN_REQ, DRAIN_WAIT, FLUSH_REQ, FLUSH_WAIT = newElement()
@@ -228,6 +228,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val drainPendingValid = Reg(Bool()) init (False)
   val drainPendingCtx = Reg(StepCtx(cfg))
   val drainPendingDelay = Reg(UInt(drainDelayW bits)) init (0)
+  val drainEnqueuePendingValid = Reg(Bool()) init (False)
+  val drainEnqueuePendingCtx = Reg(StepCtx(cfg))
   val prefetchStageSlotA = Reg(UInt(stagePtrW bits)) init (0)
   val prefetchStageSlotB = Reg(UInt(stagePtrW bits)) init (0)
   val injectStageSlotA = Reg(UInt(stagePtrW bits)) init (0)
@@ -388,11 +390,11 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   injectSeqQ.io.push.payload := stagedIssueSeq
   injectSeqQ.io.pop.ready := False
 
-  drainQ.io.push.valid := False
-  drainQ.io.push.payload := injectCtx
+  drainQ.io.push.valid := drainEnqueuePendingValid
+  drainQ.io.push.payload := drainEnqueuePendingCtx
   drainQ.io.pop.ready := False
 
-  drainDelayQ.io.push.valid := False
+  drainDelayQ.io.push.valid := drainEnqueuePendingValid
   drainDelayQ.io.push.payload := drainTailDelay
   drainDelayQ.io.pop.ready := False
 
@@ -683,6 +685,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         stagedBValid(slot) := False
       }
       drainPendingValid := False
+      drainEnqueuePendingValid := False
       flushCmdLastPending := False
       injectState := InjectState.IDLE
       drainState := DrainState.IDLE
@@ -692,28 +695,22 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
 
   // ---------- Inject engine + hazard scoreboard ----------
 
-  val enableDrainOverlap = false
-  val bankHazardForInject = Bool()
-  bankHazardForInject := False
-  if (enableDrainOverlap) {
-    when(injectQ.io.pop.valid) {
-      when(injectQ.io.pop.payload.bankSel) {
-        bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
-      } otherwise {
-        bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
-      }
-    }
-  } else {
-    when(bank0DrainBusy || bank1DrainBusy) {
-      bankHazardForInject := True
-    } elsewhen (injectQ.io.pop.valid) {
-      when(injectQ.io.pop.payload.bankSel) {
-        bankHazardForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
-      } otherwise {
-        bankHazardForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
-      }
+  val trueBankConflictForInject = Bool()
+  trueBankConflictForInject := False
+  when(injectQ.io.pop.valid) {
+    when(injectQ.io.pop.payload.bankSel) {
+      trueBankConflictForInject := bank1ComputeBusy || bank1DrainBusy || (bank1RowBusy =/= 0)
+    } otherwise {
+      trueBankConflictForInject := bank0ComputeBusy || bank0DrainBusy || (bank0RowBusy =/= 0)
     }
   }
+  val globalDrainOwnershipHazard = bank0DrainBusy || bank1DrainBusy
+  val bankHazardForInject = Bool()
+  bankHazardForInject := globalDrainOwnershipHazard || trueBankConflictForInject
+  val drainBookkeepingHazardForInject = Bool()
+  drainBookkeepingHazardForInject := injectQ.io.pop.valid &&
+    injectQ.io.pop.payload.drainTrigger &&
+    drainEnqueuePendingValid
 
   val injectStageReady = Bool()
   injectStageReady := False
@@ -733,6 +730,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
           injectSlotQ.io.pop.valid &&
           injectSeqQ.io.pop.valid &&
           !bankHazardForInject &&
+          !drainBookkeepingHazardForInject &&
           injectStageReady
       ) {
         assert(injectSeqQ.io.pop.payload === stagedConsumeSeq, "staged step order violation at inject")
@@ -780,40 +778,35 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         stagedBValid(injectStageSlotB) := False
         stagedConsumeFire := True
 
-        when(injectCtx.drainTrigger) {
-          injectState := InjectState.ENQ_DRAIN
+        when(injectCtx.bankSel) {
+          bank1ComputeBusy := False
         } otherwise {
-          when(injectCtx.bankSel) {
-            bank1ComputeBusy := False
-          } otherwise {
-            bank0ComputeBusy := False
-          }
-          injectState := InjectState.IDLE
+          bank0ComputeBusy := False
         }
+
+        when(injectCtx.drainTrigger) {
+          when(injectCtx.bankSel) {
+            bank1DrainBusy := True
+            bank1RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
+          } otherwise {
+            bank0DrainBusy := True
+            bank0RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
+          }
+          assert(!drainEnqueuePendingValid, "drain enqueue pending overflow")
+          drainEnqueuePendingValid := True
+          drainEnqueuePendingCtx := injectCtx
+        }
+        injectState := InjectState.IDLE
       } otherwise {
         feedCnt := feedCnt + 1
       }
     }
+  }
 
-    is(InjectState.ENQ_DRAIN) {
-      val canEnqueueDrain = drainQ.io.push.ready && drainDelayQ.io.push.ready
-      drainQ.io.push.valid := canEnqueueDrain
-      drainQ.io.push.payload := injectCtx
-      drainDelayQ.io.push.valid := canEnqueueDrain
-      drainDelayQ.io.push.payload := drainTailDelay
-      when(canEnqueueDrain) {
-        when(injectCtx.bankSel) {
-          bank1ComputeBusy := False
-          bank1DrainBusy := True
-          bank1RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
-        } otherwise {
-          bank0ComputeBusy := False
-          bank0DrainBusy := True
-          bank0RowBusy := B((BigInt(1) << cfg.s) - 1, cfg.s bits)
-        }
-        injectState := InjectState.IDLE
-      }
-    }
+  // Decoupled drain enqueue: keep FEED->IDLE transition independent from drain queue bookkeeping.
+  val drainEnqueueCanPush = drainQ.io.push.ready && drainDelayQ.io.push.ready
+  when(drainEnqueuePendingValid && drainEnqueueCanPush) {
+    drainEnqueuePendingValid := False
   }
 
   when(stagedProduceFire) {
@@ -1066,9 +1059,9 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val stallOutputBackpressureCond =
     (drainState === DrainState.FLUSH_WAIT) && drainPacker.io.outValid && !drainPacker.io.outReady
   val stallDrainBlockedCond =
-    (injectState === InjectState.ENQ_DRAIN) && !(drainQ.io.push.ready && drainDelayQ.io.push.ready)
-  val stallInjectDrainBookkeepingCond = injectState === InjectState.ENQ_DRAIN
-  val stallBankHazardCond = bankHazardForInject || stallInjectDrainBookkeepingCond
+    drainEnqueuePendingValid && !(drainQ.io.push.ready && drainDelayQ.io.push.ready)
+  val stallInjectDrainBookkeepingCond = drainEnqueuePendingValid
+  val stallBankHazardCond = trueBankConflictForInject
   val stallPrefetchControlCond =
     (prefetchState === PrefetchState.START_READS) ||
       (prefetchState === PrefetchState.ENQ_INJECT)
@@ -1083,7 +1076,10 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   val stallBNotReadyCond = (prefetchState === PrefetchState.LOAD_AB) && aLoadDone && !bLoadDone
   val bucketOutputBackpressureCond = stallOutputBackpressureCond
   val bucketDrainEnqueueBookkeepingCond = !bucketOutputBackpressureCond && stallInjectDrainBookkeepingCond
-  val bucketBankHazardWaitCond = !bucketOutputBackpressureCond && !bucketDrainEnqueueBookkeepingCond && bankHazardForInject
+  val bucketBankHazardWaitCond =
+    !bucketOutputBackpressureCond &&
+      !bucketDrainEnqueueBookkeepingCond &&
+      trueBankConflictForInject
   val bucketPrefetchSetupCond = !bucketOutputBackpressureCond && !bucketDrainEnqueueBookkeepingCond && !bucketBankHazardWaitCond
 
   when(utilStallSample) {
@@ -1149,6 +1145,7 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
       !drainQ.io.pop.valid &&
       !drainDelayQ.io.pop.valid &&
       !drainPendingValid &&
+      !drainEnqueuePendingValid &&
       (stagedACount === 0) &&
       (stagedBCount === 0) &&
       !readEngineA.io.busy &&

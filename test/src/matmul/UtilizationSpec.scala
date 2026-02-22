@@ -433,10 +433,38 @@ class UtilizationSpec extends AnyFunSuite {
     )
   }
 
+  private def assertIdealHazardSplit(
+      metrics: UtilizationMetrics,
+      label: String,
+      drainStepBudget: BigInt
+  ): Unit = {
+    val trueBankHazardBudget = BigInt(4)
+    val bookkeepingBudget = drainStepBudget + 4
+
+    assert(
+      metrics.window.bucketBankHazardWaitCycles <= trueBankHazardBudget,
+      s"$label true bank-hazard wait too high: got=${metrics.window.bucketBankHazardWaitCycles} budget<=$trueBankHazardBudget"
+    )
+    assert(
+      metrics.steadyStalls.stallBankHazardCycles <= trueBankHazardBudget,
+      s"$label stall_bank_hazard too high: got=${metrics.steadyStalls.stallBankHazardCycles} budget<=$trueBankHazardBudget"
+    )
+    assert(
+      metrics.window.bucketDrainEnqueueBookkeepingCycles <= bookkeepingBudget,
+      s"$label drain-enqueue bookkeeping too high: got=${metrics.window.bucketDrainEnqueueBookkeepingCycles} budget<=$bookkeepingBudget"
+    )
+    assert(
+      metrics.steadyStalls.stallDrainEnqueueBookkeepingCycles <= bookkeepingBudget,
+      s"$label stall_drain_enqueue_bookkeeping too high: got=${metrics.steadyStalls.stallDrainEnqueueBookkeepingCycles} budget<=$bookkeepingBudget"
+    )
+  }
+
   private def runGateSuite(tag: String, baseCfg: HarnessConfig): Unit = {
     val s = baseCfg.dutCfg.s
     val cmdCount = 1
     val compiled = SpinalSimConfig().withVerilator.compile(SystolicMatmul(baseCfg.dutCfg))
+    val idealCmd = mkThroughputCmd(cmdId = 7000, baseAddr = BigInt(0x1000000L), s = s)
+    val idealDrainStepBudget = BigInt(expectedStepCount(idealCmd, s))
 
     val idealCfg = baseCfg.copy(
       memoryCfg = MemoryAgentConfig(
@@ -479,6 +507,8 @@ class UtilizationSpec extends AnyFunSuite {
     assertCommonStallBudgets(ideal, s"ideal $tag")
     assertMeasuredAttribution(ideal, s"ideal $tag")
     assertFeedDutyStable(ideal, idealRepeat, s"ideal $tag", tolerance = 1e-6)
+    assertIdealHazardSplit(ideal, s"ideal $tag", drainStepBudget = idealDrainStepBudget)
+    assertIdealHazardSplit(idealRepeat, s"ideal_repeat $tag", drainStepBudget = idealDrainStepBudget)
     assert(ideal.steadyStalls.stallOutputBackpressureCycles == 0, s"ideal $tag output_backpressure must be 0")
     val idealOut = writeMetrics(ideal, s"ideal_${tag}")
     info(
