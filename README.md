@@ -20,55 +20,48 @@ This repository is currently focused on the command-driven `SystolicMatmul` desi
 Top-level dataflow:
 
 ```text
-                           +-------------------+
-cmd_* --------------------> |   CmdFrontend     | -- valid cmd --> +-------------------+
-                            +-------------------+                   |   TileScheduler   |
-                               | reject/invalid                      +-------------------+
-                               v                                              |
-                           +-------------------+                              |
-                           |     StatusGen      | <---- done/error -----------+
-                           +-------------------+               |
-                                   |                           |
-                                   v                           v
-                                sts_*                   +-------------------------+
-                                                        |         A path          |
-a_rd_req/rsp_* <--------------------------------------> | ReadEngine -> Reorder   |
-                                                        | Buffer -> TransposeBuf  |
-                                                        +-------------------------+
-                                                                     |
-                                                                     v
-                                                                +----------+
-                                                                | Skew A   |
-                                                                +----------+
+cmd_* --> CmdFrontend --> cmdDispatchQ --> TileScheduler --> stepIssueQ
+                                                           |
+                                                           v
+                        +-------------------------------------------------------+
+                        | Prefetch Engine (in SystolicMatmul top-level)         |
+                        | - config/start ReadEngine A/B                          |
+                        | - load staged A/B tile banks (depth = stagedTileDepth) |
+                        | - enqueue inject context/slot/sequence                 |
+                        +----------------------------+--------------------------+
+                                                     |
+                      a_rd_req/rsp_* <-> ReadEngineA|ReadEngineB <-> b_rd_req/rsp_*
+                                                     v
+                                         injectQ + injectSlotQ + injectSeqQ
+                                                     |
+                                                     v
+                        +-------------------------------------------------------+
+                        | Inject Engine + bank-hazard scoreboard                |
+                        | - consume staged tiles                                |
+                        | - drive SystolicCore FEED                             |
+                        | - dual-bank compute/drain ownership tracking          |
+                        +----------------------------+--------------------------+
+                                                     |
+                                                     v
+                                       SystolicCore (Skew A/B + SxS PEs)
+                                                     |
+                                                     v
+                                         drainQ + drainDelayQ
+                                                     |
+                                                     v
+                        +-------------------------------------------------------+
+                        | Drain Engine + DrainPacker                            |
+                        | - tail-delay aware drain start                         |
+                        | - in-module D-buffer + pk_cmd RMW accumulation        |
+                        | - flush to outFifo                                    |
+                        +----------------------------+--------------------------+
+                                                     |
+                                                     v
+                                                  outFifo --> d_wr_*
 
-                                                        +-------------------------+
-                                                        |         B path          |
-b_rd_req/rsp_* <--------------------------------------> | ReadEngine -> Reorder   |
-                                                        | Buffer -> FIFO          |
-                                                        +-------------------------+
-                                                                     |
-                                                                     v
-                                                                +----------+
-                                                                | Skew B   |
-                                                                +----------+
-                                                                     |
-                                                                     v
-                                                        +-------------------------+
-                                                        |       SystolicCore      |
-                                                        |      (S x S PE array)   |
-                                                        +-------------------------+
-                                                                     |
-                                                                     v
-                                                        +-------------------------+
-                                                        |       DrainPacker       |
-                                                        |  + K-reduction buffer   |
-                                                        +-------------------------+
-                                                                     |
-                                                                     v
-                                                                Out FIFO
-                                                                     |
-                                                                     v
-                                                                   d_wr_*
+Status path:
+  Cmd accept --> in-order commit queue (writes-done + drains-done + poison)
+              --> sts_*
 ```
 
 Detailed `SystolicCore` view (conceptual `S=4`, same structure scales to `SxS`):
@@ -141,15 +134,24 @@ drainData[3] = PE(drainRow, 3).drain_data
 ## Key Files
 
 - `src/matmul/SystolicMatmul.scala` - top-level integration
+- `src/matmul/CmdFrontend.scala` - command validation/accept path
 - `src/matmul/TileScheduler.scala` - primitive/micro-tile scheduling
 - `src/matmul/ReadEngine.scala` - tagged request issue + response retirement
-- `src/matmul/TransposeBuffer.scala` - A-path row/column transform
-- `src/matmul/SkewNetwork.scala` - systolic injection skew
+- `src/matmul/ReorderBuffer.scala` - in-order retirement for out-of-order responses
+- `src/matmul/SkewNetwork.scala` - systolic edge skew
 - `src/matmul/SystolicCore.scala` - PE array compute core
+- `src/matmul/PE.scala` - per-PE dual-bank FP32 MAC
+- `src/matmul/Fp32MulPipe.scala` - pipelined FP32 multiplier
+- `src/matmul/Fp32AddPipe.scala` - pipelined FP32 adder
 - `src/matmul/DrainPacker.scala` - drain, pack, and K-reduction
-- `src/matmul/StatusGen.scala` - completion and error reporting
 - `test/src/matmul/SystolicMatmulTb.scala` - integration harness
 - `test/src/matmul/PerfSpec.scala` - performance contract tests
+- `test/src/matmul/UtilizationSpec.scala` - Stage 20 utilization gates and attribution
+
+Reference/decomposition modules (currently not the active top-level control path):
+- `src/matmul/controllers/PrefetchController.scala`
+- `src/matmul/controllers/InjectController.scala`
+- `src/matmul/controllers/DrainController.scala`
 
 ## Common Commands
 
@@ -259,6 +261,10 @@ These counters are exported per scenario (`*.metrics.env`) and are intended to b
 | `stall_prefetch_setup_cycles` | Stall cycles in prefetch setup/control states. |
 | `stall_bank_hazard_wait_cycles` | Stall cycles counted in true bank-hazard wait bucket. |
 | `stall_drain_enqueue_bookkeeping_cycles` | Stall cycles counted in drain bookkeeping bucket. |
+
+Important interpretation note:
+- `utilInjectFullCycle` is a raw FEED-state indicator. The ratio `utilInjectFullCycles / utilInjectWindowCycles` includes prefetch/setup residency and is not the Stage 20 near-100% gate.
+- Stage 20 `feed_duty` uses denominator `feed + bank_hazard_wait + drain_enqueue_bookkeeping + output_backpressure` (`feed_duty_window_cycles`), which is the metric expected to be close to 1.0 in dense ideal scenarios.
 
 ## Output Artifacts
 

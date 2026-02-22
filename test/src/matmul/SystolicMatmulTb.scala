@@ -52,6 +52,8 @@ object SystolicMatmulTb {
 final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessConfig) {
   import SystolicMatmulTb._
 
+  private val u64Mask: BigInt = (BigInt(1) << 64) - 1
+
   private val expectedCompletionOrder = mutable.Queue.empty[Int]
 
   val cmdDriver = new CmdDriver(dut)
@@ -158,6 +160,12 @@ final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessC
   }
 
   def utilStallNoStepCycles: BigInt = dut.utilStallNoStepCycles.toBigInt
+  def utilInjectWindowCycles: BigInt = dut.utilInjectWindowCycles.toBigInt & u64Mask
+  def utilInjectFullCycles: BigInt = dut.utilInjectFullCycles.toBigInt & u64Mask
+  def utilStallBankHazardWaitCycles: BigInt = dut.utilStallBankHazardWaitCycles.toBigInt & u64Mask
+  def utilStallDrainEnqueueBookkeepingCycles: BigInt = dut.utilStallDrainEnqueueBookkeepingCycles.toBigInt & u64Mask
+  def utilStallOutputBackpressureCycles: BigInt = dut.utilStallOutputBackpressureCycles.toBigInt & u64Mask
+  def waitSampling(cycles: Int = 1): Unit = dut.clockDomain.waitSampling(cycles)
 
   private def compareOutputAgainstExpected(cmd: CommandDesc, expectedD: Array[Int]): Option[String] = {
     val expectedByAddr = packExpectedDCacheLines(cmd, expectedD)
@@ -229,9 +237,14 @@ final class SystolicMatmulTb(dut: SystolicMatmul, cfg: SystolicMatmulTb.HarnessC
 class SystolicMatmulTbSpec extends AnyFunSuite {
   import SystolicMatmulTb._
 
+  private val counterModulus: BigInt = BigInt(1) << 64
+
   private def f2i(f: Float): Int = java.lang.Float.floatToRawIntBits(f)
   private def envEnabled(name: String): Boolean =
     sys.env.get(name).exists(v => Set("1", "true", "yes", "on").contains(v.toLowerCase))
+
+  private def deltaCounterU64(start: BigInt, end: BigInt): BigInt =
+    if (end >= start) end - start else (end + counterModulus) - start
 
   private def mkRows(rows: Int, cols: Int, ld: Int, seed: Int): Seq[Seq[Int]] = {
     val rng = new Random(seed)
@@ -453,6 +466,77 @@ class SystolicMatmulTbSpec extends AnyFunSuite {
 
       assert(tightGapRatio >= 0.90, f"too many large output gaps for long-primitive case: tightGapRatio=$tightGapRatio%.3f")
       assert(longestTightRun >= 64, s"expected long tight run in output stream, got=$longestTightRun")
+    }
+  }
+
+  test("integration back-to-back commands sustain high FEED duty") {
+    val cfg = defaultHarnessConfigS4()
+    runCase("systolic_int_back_to_back_high_util", cfg) { tb =>
+      val s = cfg.dutCfg.s
+      val cmdCount = 6
+      val tile = 4 * s
+
+      val cmds = (0 until cmdCount).map { i =>
+        val aBase = BigInt(0x260000) + BigInt(i) * 0x50000
+        val bBase = aBase + BigInt(0x18000)
+        val dBase = aBase + BigInt(0x30000)
+        CommandDesc(
+          cmdId = 420 + i,
+          aBase = aBase,
+          bBase = bBase,
+          dBase = dBase,
+          m = tile,
+          n = tile,
+          k = 16 * s,
+          lda = 16 * s,
+          ldb = tile,
+          ldd = tile,
+          primM = tile,
+          primN = tile,
+          primK = 16 * s
+        )
+      }
+
+      val queued = cmds.zipWithIndex.map { case (cmd, i) =>
+        val a = mkRows(cmd.m, cmd.k, cmd.lda, 130 + i * 2)
+        val b = mkRows(cmd.k, cmd.n, cmd.ldb, 131 + i * 2)
+        tb.enqueueCommand(cmd, a, b)
+      }
+
+      tb.waitSampling(4)
+      val startWindow = tb.utilInjectWindowCycles
+      val startFull = tb.utilInjectFullCycles
+      val startBankHazardWait = tb.utilStallBankHazardWaitCycles
+      val startDrainBookkeeping = tb.utilStallDrainEnqueueBookkeepingCycles
+      val startOutBackpressure = tb.utilStallOutputBackpressureCycles
+
+      queued.foreach { q =>
+        assert(tb.awaitCommand(q).isInstanceOf[CommandSuccess], s"failed cmdId=${q.cmd.cmdId}")
+      }
+
+      tb.waitSampling(2)
+      val windowCycles = deltaCounterU64(startWindow, tb.utilInjectWindowCycles)
+      val fullCycles = deltaCounterU64(startFull, tb.utilInjectFullCycles)
+      val bankHazardWaitCycles = deltaCounterU64(startBankHazardWait, tb.utilStallBankHazardWaitCycles)
+      val drainBookkeepingCycles = deltaCounterU64(startDrainBookkeeping, tb.utilStallDrainEnqueueBookkeepingCycles)
+      val outBackpressureCycles = deltaCounterU64(startOutBackpressure, tb.utilStallOutputBackpressureCycles)
+      assert(windowCycles > 0, "inject window did not advance")
+      assert(fullCycles <= windowCycles, s"inject full cycles exceeded window cycles: full=$fullCycles window=$windowCycles")
+
+      val rawInjectDuty = fullCycles.toDouble / windowCycles.toDouble
+      val feedDutyWindowCycles = fullCycles + bankHazardWaitCycles + drainBookkeepingCycles + outBackpressureCycles
+      assert(feedDutyWindowCycles > 0, "feed-duty window did not advance")
+      val feedDuty = fullCycles.toDouble / feedDutyWindowCycles.toDouble
+      val expectedBeats = cmds.map(c => c.m * (c.ldd / s)).sum
+      assert(tb.out.fireCycles.length == expectedBeats, s"unexpected D beat count: got=${tb.out.fireCycles.length} exp=$expectedBeats")
+
+      info(
+        f"[b2b high-util] cmds=$cmdCount fullCycles=$fullCycles windowCycles=$windowCycles rawInjectDuty=$rawInjectDuty%.6f " +
+          f"feedDutyWindow=$feedDutyWindowCycles feedDuty=$feedDuty%.6f beats=$expectedBeats"
+      )
+
+      assert(feedDuty >= 0.95, f"FEED duty too low for back-to-back dense run: duty=$feedDuty%.6f")
+      assert(feedDuty <= 1.0, f"FEED duty invalid (>1): duty=$feedDuty%.6f")
     }
   }
 

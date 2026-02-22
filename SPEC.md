@@ -1,13 +1,13 @@
 # Systolic FP32 Matmul - Architecture Specification
 
-**Version:** 1.1-draft
-**Date:** 2026-02-21
+**Version:** 1.2-draft
+**Date:** 2026-02-22
 
 ## 1. Executive Summary
 
-This document is the unified architecture spec for a fully pipelined FP32 matrix multiplier.
-It combines a strict interface and verification contract with detailed, implementation-oriented
-micro-architecture guidance for systolic dataflow, transpose/skew behavior, and PE organization.
+This document is the unified architecture spec for the command-driven FP32 systolic matrix
+multiplier implemented in this repository. It combines strict interface/verification contracts
+with implementation-oriented guidance for the current staged-tile + inject/drain pipeline.
 
 The unit computes:
 
@@ -47,7 +47,7 @@ Primary performance goals:
 
 - `CL`: cacheline
 - `E`: FP32 elements per cacheline (`CL_BITS / 32`)
-- `S`: physical systolic dimension (`S = E`, default 16)
+- `S`: physical systolic dimension (`S = E`, default 4 in this repo)
 - `Primitive`: command-level tiled matmul work unit
 - `Micro-tile`: one physical `S x S` output tile computed by the array
 - `PE`: processing element (FP32 MAC + dual accumulator banks)
@@ -57,11 +57,12 @@ Primary performance goals:
 | Parameter | Default | Description |
 |---|---:|---|
 | `ADDR_BITS` | 64 | Address width for all memory interfaces |
-| `CL_BITS` | 512 | Cacheline width (must be multiple of 32) |
+| `CL_BITS` | 128 | Cacheline width (must be multiple of 32) |
 | `FP_BITS` | 32 | FP element width |
 | `MAX_OUTSTANDING_RD` | 16 | Max in-flight reads per input interface (must be power of 2) |
 | `CMDQ_DEPTH` | 4 | Command queue depth |
 | `OUT_FIFO_DEPTH_CL` | 32 | Output elastic buffer depth in CLs |
+| `STAGED_TILE_DEPTH` | 8 | Depth of staged A/B tile ring between prefetch and inject |
 | `L_MUL` | 4 | FP32 multiplier pipeline depth (implementation target) |
 | `L_ADD` | 4 | FP32 adder pipeline depth (implementation target) |
 
@@ -75,7 +76,8 @@ Derived:
 Tag space equals `MAX_OUTSTANDING_RD`. Each tag maps 1:1 to a reorder-buffer slot, so no
 free-list is needed — tags are allocated sequentially and retired in-order by the reorder buffer.
 
-For default `CL_BITS = 512`, `CL_ELEMS = S = 16` and one cacheline carries one 16-element FP32 row.
+For default `CL_BITS = 128`, `CL_ELEMS = S = 4` and one cacheline carries one 4-element FP32 row.
+The same architecture is also validated at `CL_BITS = 512` (`S = 16`) in regression/perf tests.
 
 ## 4. Supported Primitive Sizes and Command Constraints
 
@@ -87,7 +89,12 @@ Let `E = CL_ELEMS`.
 - Supported `prim_n`: `{E, 2E, 4E, 8E}`
 - Supported `prim_k`: `{E, 2E, 4E, 8E, 16E}`
 
-For `E = 16`:
+For current repo default `E = 4`:
+
+- `prim_m`, `prim_n` in `{4, 8, 16, 32}`
+- `prim_k` in `{4, 8, 16, 32, 64}`
+
+For `E = 16` (full-size mode):
 
 - `prim_m`, `prim_n` in `{16, 32, 64, 128}`
 - `prim_k` in `{16, 32, 64, 128, 256}`
@@ -113,7 +120,7 @@ in `(mi, nj)` for predictable `D` write addresses.
 | Port | Dir | Width | Description |
 |---|---|---:|---|
 | `clk` | in | 1 | Clock |
-| `rst_n` | in | 1 | Active-low synchronous reset |
+| `reset` | in | 1 | Active-high synchronous reset |
 
 ### 5.2 Command Descriptor Input (Decoupled)
 
@@ -239,43 +246,56 @@ counts; the address generators widen them before multiplication.
 ### 7.1 Component and Boundary View (ASCII)
 
 ```text
-                      +--------------------------------------+
-cmd_* --------------> | Command Frontend + Validation + CMDQ |
-                      +-------------------+------------------+
-                                          |
-                                          v
-                      +--------------------------------------+
-                      | Tile Scheduler / Primitive Dispatcher |
-                      +-----------+---------------+----------+
-                                  |               |
-                                  v               v
-                     +------------------+  +------------------+
-a_rd_* <-----------> | A Read Engine    |  | B Read Engine    | <-----------> b_rd_*
-                     | (tags + credits) |  | (tags + credits) |
-                     +--------+---------+  +--------+---------+
-                              |                     |
-                              v                     v
-               +---------------------------+  +-----------------+
-               | A Input FIFO + Transpose  |  | B Input FIFO    |
-               +-------------+-------------+  +---------+-------+
-                             |                          |
-                             v                          v
-                       +----------------------------------------+
-                       | A/B Skew Networks -> Systolic FP32 Core|
-                       | (16x16 PEs, dual accumulator banks)    |
-                       +-------------------+--------------------+
-                                           |
-                                           v
-                    +------------------------------------------+
-                    | Drain Mux + Output Packer + D Write FIFO |
-                    +-------------------+----------------------+
-                                        |
-d_wr_* <-------------------------------+------------------------------
-sts_* <----------------------- Completion/Status Generator ----------
+cmd_* --> CmdFrontend --> cmdDispatchQ --> TileScheduler --> stepIssueQ
+                                                           |
+                                                           v
+                     +---------------------------------------------------+
+                     | Prefetch Engine (top-level FSM)                   |
+                     | - config/start ReadEngine A/B                     |
+                     | - load staged A/B tile ring buffers               |
+                     | - enqueue inject context/slot/sequence            |
+                     +-------------------------+-------------------------+
+                                               |
+a_rd_* <------> ReadEngine A (tags + reorder)  |  ReadEngine B (tags + reorder) <------> b_rd_*
+                                               v
+                              injectQ + injectSlotQ + injectSeqQ
+                                               |
+                                               v
+                     +---------------------------------------------------+
+                     | Inject Engine + hazard scoreboard                 |
+                     | - FEED S cycles into SystolicCore                |
+                     | - bank ownership / conflict gating               |
+                     +-------------------------+-------------------------+
+                                               |
+                                               v
+                                A/B skew -> SystolicCore (SxS PEs)
+                                               |
+                                               v
+                                    drainQ + drainDelayQ
+                                               |
+                                               v
+                     +---------------------------------------------------+
+                     | Drain Engine + DrainPacker                        |
+                     | - tail-delay aware drain start                    |
+                     | - in-module RMW K-reduction buffer               |
+                     | - flush to outFifo                               |
+                     +-------------------------+-------------------------+
+                                               |
+                                               v
+                                            outFifo --> d_wr_*
+
+status:
+  command accept + drain/write completion + poison/error
+    --> in-order commit queue --> sts_*
 ```
 
 This split keeps command, memory, compute, and output decoupled so variable memory latency and
-downstream write stalls do not immediately bubble the compute path.
+downstream write stalls do not immediately bubble the FEED path.
+
+Implementation note:
+- In the current repository revision, prefetch/inject/drain engines are implemented directly in
+  `SystolicMatmul.scala`. Decomposed controller modules under `src/matmul/controllers/` are
+  maintained as reference structure but are not the active top-level control path.
 
 ### 7.2 Behavior View (Mermaid)
 
@@ -338,11 +358,10 @@ for mi in 0 .. (prim_m / S) - 1:
 
 **K-reduction across primitives:** When `K > prim_k`, multiple primitives contribute partial
 sums to the same output tile. Since each primitive zero-initializes its accumulator, the partial
-`D` results must be summed. The drain stage handles this: for `pk_cmd > 0`, it reads the
-existing `D` value from the output FIFO's local buffer (which still holds the previous write
-data for that address) and adds the new partial sum before writing. The first primitive for a
-given `(pi, pj)` writes directly. This is purely internal to the drain/output stage and does
-not require an additional external read interface.
+`D` results must be summed. The drain stage handles this in `DrainPacker`: for `pk_cmd > 0`,
+it reads the prior partial line from an internal D-buffer (`dBuffer`), performs FP32 lane-wise
+add with the newly drained line, and writes the merged line back. The first primitive for a
+given `(pi, pj)` writes directly. No additional external read interface is required.
 
 Command-level primitive order is row-major in `(pi, pj)` with `pk_cmd` innermost, ensuring all
 partial K-contributions for a given output tile complete before moving to the next tile.
@@ -362,25 +381,43 @@ partial K-contributions for a given output tile complete before moving to the ne
   - credits available (outstanding < `MAX_OUTSTANDING_RD`)
   - reorder buffer has a free slot
 - Responses arrive out-of-order and are written to the reorder buffer slot indexed by tag.
-- The reorder buffer head drains in-order into the downstream FIFO/transpose buffer.
+- The reorder buffer head drains in-order into the staged tile buffers.
 - Any `*_rd_rsp_err` triggers command failure handling.
 
-### 8.4 A Path: FIFO + Transpose Buffer
+### 8.4 Staged A/B Tile Buffers (Current Implementation)
 
-`A` arrives from memory as row-major cachelines; systolic west-edge needs column-time order.
+The top-level keeps a deep ring of staged tile slots (`STAGED_TILE_DEPTH`) shared by A and B.
+Each slot corresponds to one micro-tile context queued for FEED.
 
-- `A` response FIFO buffers CLs.
-- A double-buffered `S x S` transpose buffer stores one micro-tile bank while the other bank is read.
-- Write side: one CL per clock fills row `0..S-1`.
-- Read side: one column per clock emits `{A[0][k], A[1][k], ..., A[S-1][k]}`.
-- Bank swap every `S` feed cycles when both read/write sides complete.
+- `A` load: `S` cachelines are read and unpacked into `aStageTiles(slot)(row)(elem)`.
+- `B` load: `S` cachelines are read into `bStageTiles(slot)(rowCL)`.
+- Producer/consumer pointers for A and B are kept lockstep, with sequence assertions to prevent
+  slot mismatch or out-of-order consume.
+- A/B tiles are staged by the prefetch engine and consumed by the inject engine through
+  `injectQ`, `injectSlotQ`, and `injectSeqQ`.
 
-### 8.5 B Path: FIFO (No Transpose)
+Column-time A feed is produced directly from staged storage during inject:
+- cycle `k`: `aIn(i) = aStageTiles(slot)(i)(k)` and `bIn(j) = bStageTiles(slot)(k)(j)`.
 
-`B` cacheline rows already match north-edge row-time feed format.
+This realizes the transpose behavior without a standalone `TransposeBuffer` module in the active
+top-level datapath.
 
-- `B` response FIFO buffers CLs.
-- One CL per clock emits `{B[k][0], ..., B[k][S-1]}` into the B skew network.
+### 8.5 Inject/Prefetch/Drain Control Split
+
+Control is implemented as three cooperating engines in `SystolicMatmul`:
+
+- Prefetch engine:
+  - pops step contexts,
+  - runs A/B reads and staged-tile fill,
+  - enqueues inject contexts.
+- Inject engine:
+  - drains staged contexts into `S` FEED cycles,
+  - enforces bank hazard ownership checks,
+  - optionally chains directly into next FEED to reduce bubbles.
+- Drain engine:
+  - decoupled via `drainQ` and `drainDelayQ`,
+  - waits `drainTailDelay = 2*(S-1) + L_MUL + L_ADD + 1`,
+  - requests drain/flush from `DrainPacker`.
 
 ### 8.6 Skew Networks
 
@@ -396,7 +433,7 @@ Alignment rule:
 
 ### 8.7 Systolic Core and PE Behavior
 
-- Physical core is `S x S` PEs (`16 x 16` at default settings).
+- Physical core is `S x S` PEs (`4 x 4` at repo default, `16 x 16` in full-size mode).
 - Horizontal `A` and vertical `B` forwarding each incur one registered hop.
 - Each PE contains:
   - FP32 multiply pipeline (`L_MUL`)
@@ -419,7 +456,7 @@ this micro-tile is not ready for drain until this tail completes.
 
 Required no-bubble condition between micro-tile contexts:
 
-- If `d_wr_ready=1` and A/B FIFOs remain above low-water marks, the inject phase of micro-tile
+- If `d_wr_ready=1` and the next staged A/B context is available, the inject phase of micro-tile
   `T(n+1)` starts no later than the cycle after the final inject cycle of micro-tile `T(n)`.
 - The skew tail of `T(n)` overlaps with the inject phase of `T(n+1)` — they use different
   accumulator banks, so no conflict occurs.
@@ -431,11 +468,13 @@ Bank exclusivity rule:
 
 ### 8.10 Drain, Output Packer, and Backpressure
 
-- Drain reads one output row per cycle from the inactive bank set.
-- `S` FP32 values are packed into one `CL_BITS` beat.
-- Drain/output can sustain `1 CL/cycle` when `d_wr_ready=1`.
-- `OUT_FIFO_DEPTH_CL` absorbs temporary downstream stalls.
-- On prolonged backpressure, scheduler throttles new starts; if FIFO is full, pipeline stalls losslessly.
+- `DrainPacker` drains one row per cycle from the inactive bank and packs `S` FP32 values into
+  one `CL_BITS` beat.
+- For `pk_cmd > 0`, drained lines are merged with prior partials via internal D-buffer RMW.
+- Flush phase streams packed lines through `outFifo` to `d_wr_*`.
+- Drain/output can sustain `1 CL/cycle` in flush windows when `d_wr_ready=1`.
+- `OUT_FIFO_DEPTH_CL` absorbs temporary downstream stalls; prolonged stalls backpressure flush
+  and are attributed by utilization counters.
 
 ## 9. Timing and Throughput Contract
 
@@ -450,7 +489,7 @@ Bank exclusivity rule:
 Under these conditions:
 
 - `d_wr_ready` remains asserted often enough to avoid permanent output blockage
-- memory returns enough A/B responses to keep input FIFOs above low watermarks
+- memory returns enough A/B responses to keep staged contexts available to inject
 - no protocol errors are observed
 
 the unit shall:
@@ -538,12 +577,15 @@ contracts above are normative.
 - A/B responses are **tagged** and may be out-of-order.
 - Command completion/status is explicit and includes error code.
 - Physical compute core is `S x S` output-stationary with dual accumulator banks.
+- Repository default build point is `CL_BITS=128` (`S=4`), with full-size validation at `S=16`.
+- Active top-level uses staged A/B tile buffers plus decoupled prefetch/inject/drain engines.
+- Status is produced by an in-order commit queue in `SystolicMatmul` (no separate wired `StatusGen` block).
 - Primitive overlap is required as a performance contract, not an optional optimization.
 
 ## 14. Open Questions
 
 - Confirm final software-visible encoding for `sts_err_code` values.
-- Confirm whether command ID width should remain 16 bits or be narrowed by integration.
+- Confirm whether additional externally-visible utilization/perf counters are needed beyond simulation-public signals.
 
 ### Resolved (v1.1)
 
