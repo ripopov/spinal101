@@ -25,7 +25,7 @@
 - [x] **Stage 17** — Deep staged-tile buffering and injector decoupling
 - [x] **Stage 18** — Drain decoupling and hazard narrowing
 - [x] **Stage 19** — FEED run-length optimization
-- [ ] **Stage 20** — Near-100% PE utilization CI closure
+- [x] **Stage 20** — Near-100% PE utilization CI closure
 
 ---
 

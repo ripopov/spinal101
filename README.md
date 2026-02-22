@@ -192,32 +192,73 @@ make prepnr PREPNR_S=16
 
 `make flow` runs test + pre-PnR + report, and uses the same pre-PnR default (`PREPNR_S=4`).
 
-## Utilization Gates (Stage 14)
+## Utilization Gates (Stage 20)
 
-`UtilizationSpec` now enforces quantitative utilization gates and exports per-scenario metrics to:
+`UtilizationSpec` exports per-scenario utilization metrics to:
 
 - `build/utilization_gates/*.metrics.env`
 
-Scenarios covered in CI (`S=4` and `S=16`):
+CI now enforces explicit Stage 20 gates in the workflow in addition to test assertions:
 
-- Ideal no-latency/no-backpressure stream
-- Random-latency stream with outstanding-depth checks
-- Output-backpressure sensitivity sweep
+- `feed_duty >= 0.95` in `ideal_feed_dense` for `S=4` and `S=16`
+- `req_duty_a` / `req_duty_b` floors in `ideal_feed_dense`:
+  - `S=4 >= 0.39`
+  - `S=16 >= 0.70`
+- bounded true bank-conflict stalls in ideal scenarios:
+  - `stall_bank_hazard_cycles <= 4`
+  - `bucket_bank_hazard_wait_cycles <= 4`
 
-Current gate outcomes (from local `mill spinal101.test.testOnly matmul.UtilizationSpec`):
+Current near-100% gate outcomes (local `mill spinal101.test.testOnly matmul.UtilizationSpec`):
 
-| Scenario | S=4 | S=16 |
+| Metric (ideal_feed_dense) | S=4 | S=16 |
 | --- | --- | --- |
-| Ideal array utilization | 1.000000 | 1.000000 |
-| Ideal stream utilization | 1.000000 | 1.000000 |
-| Random-latency stream utilization | 1.000000 | 1.000000 |
-| Backpressure sweep stream utilization (bp0/bp1/bp2/bp3) | 0.275653 / 0.275616 / 0.275616 / 0.275579 | 0.403170 / 0.403131 / 0.403170 / 0.403170 |
+| `feed_duty` | 0.985563 | 0.996351 |
+| `req_duty_a` | 0.399374 | 0.725204 |
+| `req_duty_b` | 0.399374 | 0.725204 |
+| `stall_bank_hazard_cycles` | 0 | 0 |
+| `bucket_bank_hazard_wait_cycles` | 0 | 0 |
+| `feed_run_longest_cycles` | 20 | 208 |
+| `feed_run_average_cycles` | 5.224490 | 53.894737 |
 
-Remaining non-ideal corner cases:
+CI summaries now publish trend tables for:
 
-- `stall_a_not_ready` and `stall_bank_hazard` remain high in long-window accounting; the controller is correct but still conservative around queue/bank transition windows.
-- Backpressure sweep currently shows only minor utilization deltas because output buffering absorbs most periodic stalls for these workloads.
-- `stall_output_backpressure_cycles` remains zero in these gated runs; heavier sustained output throttling is required to move this counter.
+- `feed_duty` (S4 vs S16 across scenarios)
+- `req_duty_a` / `req_duty_b` (S4 vs S16 across scenarios)
+- FEED run-length metrics (`feed_run_longest_cycles`, `feed_run_average_cycles`, `feed_break_count`)
+
+### Utilization Counter Guide
+
+These counters are exported per scenario (`*.metrics.env`) and are intended to be read together.
+
+| Counter(s) | Interpretation |
+| --- | --- |
+| `measured_window_start_cycle`, `measured_window_end_cycle`, `measured_window_cycles` | Measurement span used for utilization accounting. |
+| `measured_feed_cycles` | Cycles where injector is in FEED (`utilInjectFullCycle`). |
+| `measured_stall_sample_cycles` | Non-FEED sampled cycles in the same window (`utilStallSample`). |
+| `feed_duty_window_cycles` | Denominator for `feed_duty`: `feed + bank_hazard_wait + drain_enqueue_bookkeeping + output_backpressure`. |
+| `feed_duty` | Effective FEED duty factor within the FEED-activity window. |
+| `req_fire_a_cycles`, `req_fire_b_cycles` | Cycles where A/B read requests fire (`valid && ready`). |
+| `req_duty_a`, `req_duty_b` | A/B request duty over `measured_window_cycles`. |
+| `bucket_prefetch_setup_cycles` | Non-FEED cycles attributed to prefetch/setup residency. |
+| `bucket_bank_hazard_wait_cycles` | Non-FEED cycles attributed to true bank conflict waiting. |
+| `bucket_drain_enqueue_bookkeeping_cycles` | Non-FEED cycles attributed to drain-enqueue bookkeeping serialization. |
+| `bucket_output_backpressure_cycles` | Non-FEED cycles attributed to output channel backpressure. |
+| `bucket_non_feed_cycles`, `bucket_non_feed_sum_cycles` | Sanity check: classified non-FEED cycles should match sampled non-FEED cycles. |
+| `feed_run_count` | Number of FEED streaks in the measured window. |
+| `feed_run_longest_cycles` | Longest contiguous FEED streak length. |
+| `feed_run_average_cycles` | Average FEED streak length. |
+| `feed_break_count` | Number of FEED-to-non-FEED transitions that later return to FEED. |
+| `feed_break_prefetch_setup`, `feed_break_bank_hazard_wait`, `feed_break_drain_enqueue_bookkeeping`, `feed_break_output_backpressure`, `feed_break_other` | First classified cause for each FEED break. |
+| `feed_break_classified_count` | Sanity check: sum of FEED break causes. |
+| `stall_no_step_cycles` | No-step stall cycles (scheduler/inject starvation). |
+| `stall_a_not_ready_cycles`, `stall_b_not_ready_cycles` | A/B readiness-limited stall cycles. |
+| `stall_bank_hazard_cycles` | Stall cycles due to true bank conflict hazard. |
+| `stall_drain_blocked_cycles` | Stall cycles where drain enqueue cannot push. |
+| `stall_output_backpressure_cycles` | Stall cycles due to D-channel backpressure. |
+| `stall_error_flush_cycles` | Stall cycles while error flush/fence is active. |
+| `stall_prefetch_setup_cycles` | Stall cycles in prefetch setup/control states. |
+| `stall_bank_hazard_wait_cycles` | Stall cycles counted in true bank-hazard wait bucket. |
+| `stall_drain_enqueue_bookkeeping_cycles` | Stall cycles counted in drain bookkeeping bucket. |
 
 ## Output Artifacts
 

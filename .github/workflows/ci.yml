@@ -22,6 +22,20 @@ jobs:
       util_ideal_s16_stream: ${{ steps.util_metrics.outputs.ideal_s16_stream }}
       util_randlat_s4_stream: ${{ steps.util_metrics.outputs.randlat_s4_stream }}
       util_randlat_s16_stream: ${{ steps.util_metrics.outputs.randlat_s16_stream }}
+      util_ideal_feed_dense_s4_feed_duty: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_feed_duty }}
+      util_ideal_feed_dense_s16_feed_duty: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_feed_duty }}
+      util_ideal_feed_dense_s4_req_duty_a: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_req_duty_a }}
+      util_ideal_feed_dense_s4_req_duty_b: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_req_duty_b }}
+      util_ideal_feed_dense_s16_req_duty_a: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_req_duty_a }}
+      util_ideal_feed_dense_s16_req_duty_b: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_req_duty_b }}
+      util_ideal_feed_dense_s4_bank_hazard: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_bank_hazard }}
+      util_ideal_feed_dense_s16_bank_hazard: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_bank_hazard }}
+      util_ideal_feed_dense_s4_feed_run_longest: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_feed_run_longest }}
+      util_ideal_feed_dense_s16_feed_run_longest: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_feed_run_longest }}
+      util_ideal_feed_dense_s4_feed_run_average: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_feed_run_average }}
+      util_ideal_feed_dense_s16_feed_run_average: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_feed_run_average }}
+      util_ideal_feed_dense_s4_feed_break_count: ${{ steps.util_metrics.outputs.ideal_feed_dense_s4_feed_break_count }}
+      util_ideal_feed_dense_s16_feed_break_count: ${{ steps.util_metrics.outputs.ideal_feed_dense_s16_feed_break_count }}
 
     steps:
       - name: Checkout
@@ -95,6 +109,20 @@ jobs:
               "ideal_s16_stream": "n/a",
               "randlat_s4_stream": "n/a",
               "randlat_s16_stream": "n/a",
+              "ideal_feed_dense_s4_feed_duty": "n/a",
+              "ideal_feed_dense_s16_feed_duty": "n/a",
+              "ideal_feed_dense_s4_req_duty_a": "n/a",
+              "ideal_feed_dense_s4_req_duty_b": "n/a",
+              "ideal_feed_dense_s16_req_duty_a": "n/a",
+              "ideal_feed_dense_s16_req_duty_b": "n/a",
+              "ideal_feed_dense_s4_bank_hazard": "n/a",
+              "ideal_feed_dense_s16_bank_hazard": "n/a",
+              "ideal_feed_dense_s4_feed_run_longest": "n/a",
+              "ideal_feed_dense_s16_feed_run_longest": "n/a",
+              "ideal_feed_dense_s4_feed_run_average": "n/a",
+              "ideal_feed_dense_s16_feed_run_average": "n/a",
+              "ideal_feed_dense_s4_feed_break_count": "n/a",
+              "ideal_feed_dense_s16_feed_break_count": "n/a",
           }
 
           with open(output_path, "a", encoding="utf-8") as out_f:
@@ -121,6 +149,9 @@ jobs:
               rows.append(data)
               by_key[(data.get("scenario", ""), data.get("s", ""))] = data
 
+          def metric(scenario, s, key, default="n/a"):
+              return by_key.get((scenario, s), {}).get(key, default)
+
           with open(summary_path, "a", encoding="utf-8") as summary_f:
               summary_f.write("## Utilization Gates\n")
               summary_f.write("| Scenario | S | Array Util | Stream Util | no_step | a_not_ready | bank_hazard | out_bp | err_flush |\n")
@@ -134,35 +165,186 @@ jobs:
                       f"{row.get('stall_error_flush_cycles', 'n/a')} |\n"
                   )
 
-              summary_f.write("\n### Utilization Trend (S4 vs S16)\n")
+              summary_f.write("\n### Array/Stream Trend (S4 vs S16)\n")
               summary_f.write("| Scenario | S4 Array | S16 Array | S4 Stream | S16 Stream |\n")
               summary_f.write("| --- | --- | --- | --- | --- |\n")
               for scenario in [
                   "ideal",
+                  "ideal_feed_dense",
+                  "ideal_long_batch",
+                  "ideal_mixed_prims",
                   "random_latency",
                   "backpressure_bp0",
                   "backpressure_bp1",
                   "backpressure_bp2",
                   "backpressure_bp3",
               ]:
-                  s4 = by_key.get((scenario, "4"), {})
-                  s16 = by_key.get((scenario, "16"), {})
                   summary_f.write(
-                      f"| {scenario} | {s4.get('array_utilization', 'n/a')} | {s16.get('array_utilization', 'n/a')} | "
-                      f"{s4.get('stream_utilization', 'n/a')} | {s16.get('stream_utilization', 'n/a')} |\n"
+                      f"| {scenario} | {metric(scenario, '4', 'array_utilization')} | {metric(scenario, '16', 'array_utilization')} | "
+                      f"{metric(scenario, '4', 'stream_utilization')} | {metric(scenario, '16', 'stream_utilization')} |\n"
+                  )
+
+              summary_f.write("\n### Feed Duty Trend (S4 vs S16)\n")
+              summary_f.write("| Scenario | S4 feed_duty | S16 feed_duty |\n")
+              summary_f.write("| --- | --- | --- |\n")
+              for scenario in [
+                  "ideal",
+                  "ideal_feed_dense",
+                  "ideal_long_batch",
+                  "ideal_mixed_prims",
+                  "random_latency",
+                  "backpressure_bp0",
+                  "backpressure_bp1",
+                  "backpressure_bp2",
+                  "backpressure_bp3",
+              ]:
+                  summary_f.write(
+                      f"| {scenario} | {metric(scenario, '4', 'feed_duty')} | {metric(scenario, '16', 'feed_duty')} |\n"
+                  )
+
+              summary_f.write("\n### Read Request Duty Trend (S4 vs S16)\n")
+              summary_f.write("| Scenario | S4 req_duty_a | S4 req_duty_b | S16 req_duty_a | S16 req_duty_b |\n")
+              summary_f.write("| --- | --- | --- | --- | --- |\n")
+              for scenario in [
+                  "ideal",
+                  "ideal_feed_dense",
+                  "ideal_long_batch",
+                  "ideal_mixed_prims",
+                  "random_latency",
+                  "backpressure_bp0",
+                  "backpressure_bp1",
+                  "backpressure_bp2",
+                  "backpressure_bp3",
+              ]:
+                  summary_f.write(
+                      f"| {scenario} | {metric(scenario, '4', 'req_duty_a')} | {metric(scenario, '4', 'req_duty_b')} | "
+                      f"{metric(scenario, '16', 'req_duty_a')} | {metric(scenario, '16', 'req_duty_b')} |\n"
+                  )
+
+              summary_f.write("\n### FEED Run-Length Trend (S4 vs S16)\n")
+              summary_f.write("| Scenario | S4 longest | S4 avg | S4 breaks | S16 longest | S16 avg | S16 breaks |\n")
+              summary_f.write("| --- | --- | --- | --- | --- | --- | --- |\n")
+              for scenario in [
+                  "ideal",
+                  "ideal_feed_dense",
+                  "ideal_long_batch",
+                  "ideal_mixed_prims",
+                  "random_latency",
+                  "backpressure_bp0",
+                  "backpressure_bp1",
+                  "backpressure_bp2",
+                  "backpressure_bp3",
+              ]:
+                  summary_f.write(
+                      f"| {scenario} | {metric(scenario, '4', 'feed_run_longest_cycles')} | {metric(scenario, '4', 'feed_run_average_cycles')} | "
+                      f"{metric(scenario, '4', 'feed_break_count')} | {metric(scenario, '16', 'feed_run_longest_cycles')} | "
+                      f"{metric(scenario, '16', 'feed_run_average_cycles')} | {metric(scenario, '16', 'feed_break_count')} |\n"
                   )
 
           exports = {
-              "ideal_s4_array": by_key.get(("ideal", "4"), {}).get("array_utilization", "n/a"),
-              "ideal_s16_array": by_key.get(("ideal", "16"), {}).get("array_utilization", "n/a"),
-              "ideal_s4_stream": by_key.get(("ideal", "4"), {}).get("stream_utilization", "n/a"),
-              "ideal_s16_stream": by_key.get(("ideal", "16"), {}).get("stream_utilization", "n/a"),
-              "randlat_s4_stream": by_key.get(("random_latency", "4"), {}).get("stream_utilization", "n/a"),
-              "randlat_s16_stream": by_key.get(("random_latency", "16"), {}).get("stream_utilization", "n/a"),
+              "ideal_s4_array": metric("ideal", "4", "array_utilization"),
+              "ideal_s16_array": metric("ideal", "16", "array_utilization"),
+              "ideal_s4_stream": metric("ideal", "4", "stream_utilization"),
+              "ideal_s16_stream": metric("ideal", "16", "stream_utilization"),
+              "randlat_s4_stream": metric("random_latency", "4", "stream_utilization"),
+              "randlat_s16_stream": metric("random_latency", "16", "stream_utilization"),
+              "ideal_feed_dense_s4_feed_duty": metric("ideal_feed_dense", "4", "feed_duty"),
+              "ideal_feed_dense_s16_feed_duty": metric("ideal_feed_dense", "16", "feed_duty"),
+              "ideal_feed_dense_s4_req_duty_a": metric("ideal_feed_dense", "4", "req_duty_a"),
+              "ideal_feed_dense_s4_req_duty_b": metric("ideal_feed_dense", "4", "req_duty_b"),
+              "ideal_feed_dense_s16_req_duty_a": metric("ideal_feed_dense", "16", "req_duty_a"),
+              "ideal_feed_dense_s16_req_duty_b": metric("ideal_feed_dense", "16", "req_duty_b"),
+              "ideal_feed_dense_s4_bank_hazard": metric("ideal_feed_dense", "4", "stall_bank_hazard_cycles"),
+              "ideal_feed_dense_s16_bank_hazard": metric("ideal_feed_dense", "16", "stall_bank_hazard_cycles"),
+              "ideal_feed_dense_s4_feed_run_longest": metric("ideal_feed_dense", "4", "feed_run_longest_cycles"),
+              "ideal_feed_dense_s16_feed_run_longest": metric("ideal_feed_dense", "16", "feed_run_longest_cycles"),
+              "ideal_feed_dense_s4_feed_run_average": metric("ideal_feed_dense", "4", "feed_run_average_cycles"),
+              "ideal_feed_dense_s16_feed_run_average": metric("ideal_feed_dense", "16", "feed_run_average_cycles"),
+              "ideal_feed_dense_s4_feed_break_count": metric("ideal_feed_dense", "4", "feed_break_count"),
+              "ideal_feed_dense_s16_feed_break_count": metric("ideal_feed_dense", "16", "feed_break_count"),
           }
           with open(output_path, "a", encoding="utf-8") as out_f:
               for key, value in exports.items():
                   out_f.write(f"{key}={value}\n")
+          PY
+
+      - name: Utilization CI Gates
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import sys
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          metric_files = sorted(glob.glob("build/utilization_gates/*.metrics.env"))
+          if not metric_files:
+              print("No utilization metrics were generated; cannot evaluate utilization gates.")
+              sys.exit(1)
+
+          by_key = {}
+          for path in metric_files:
+              data = {}
+              with open(path, "r", encoding="utf-8") as in_f:
+                  for line in in_f:
+                      line = line.strip()
+                      if not line or line.startswith("#") or "=" not in line:
+                          continue
+                      k, v = line.split("=", 1)
+                      data[k] = v
+              by_key[(data.get("scenario", ""), data.get("s", ""))] = data
+
+          def get_num(scenario, s, key):
+              row = by_key.get((scenario, s), {})
+              raw = row.get(key, "")
+              if raw == "":
+                  raise ValueError(f"missing metric scenario={scenario} s={s} key={key}")
+              return float(raw)
+
+          checks = []
+          for s, req_floor in [("4", 0.39), ("16", 0.70)]:
+              checks.append((f"ideal_feed_dense S={s} feed_duty", get_num("ideal_feed_dense", s, "feed_duty"), 0.95, ">="))
+              checks.append((f"ideal_feed_dense S={s} req_duty_a", get_num("ideal_feed_dense", s, "req_duty_a"), req_floor, ">="))
+              checks.append((f"ideal_feed_dense S={s} req_duty_b", get_num("ideal_feed_dense", s, "req_duty_b"), req_floor, ">="))
+
+          bank_hazard_budget = 4.0
+          for scenario in ["ideal", "ideal_feed_dense"]:
+              for s in ["4", "16"]:
+                  checks.append((
+                      f"{scenario} S={s} stall_bank_hazard_cycles",
+                      get_num(scenario, s, "stall_bank_hazard_cycles"),
+                      bank_hazard_budget,
+                      "<="
+                  ))
+                  checks.append((
+                      f"{scenario} S={s} bucket_bank_hazard_wait_cycles",
+                      get_num(scenario, s, "bucket_bank_hazard_wait_cycles"),
+                      bank_hazard_budget,
+                      "<="
+                  ))
+
+          failures = []
+          with open(summary_path, "a", encoding="utf-8") as summary_f:
+              summary_f.write("\n### Utilization CI Gates (Stage 20)\n")
+              summary_f.write("| Check | Observed | Requirement | Result |\n")
+              summary_f.write("| --- | --- | --- | --- |\n")
+              for label, observed, limit, op in checks:
+                  if op == ">=":
+                      passed = observed >= limit
+                      req = f">= {limit:.6f}"
+                  else:
+                      passed = observed <= limit
+                      req = f"<= {limit:.0f}"
+                  result = "PASS" if passed else "FAIL"
+                  summary_f.write(f"| {label} | {observed:.6f} | {req} | {result} |\n")
+                  if not passed:
+                      failures.append((label, observed, req))
+
+          if failures:
+              for label, observed, req in failures:
+                  print(f"FAILED: {label}: observed={observed:.6f} requirement={req}")
+              sys.exit(1)
+
+          print("All utilization CI gates passed.")
           PY
 
       - name: Upload test log
@@ -299,6 +481,20 @@ jobs:
           UTIL_IDEAL_S16_STREAM: ${{ needs.build-and-test.outputs.util_ideal_s16_stream }}
           UTIL_RANDLAT_S4_STREAM: ${{ needs.build-and-test.outputs.util_randlat_s4_stream }}
           UTIL_RANDLAT_S16_STREAM: ${{ needs.build-and-test.outputs.util_randlat_s16_stream }}
+          UTIL_IDEAL_FEED_DENSE_S4_FEED_DUTY: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_feed_duty }}
+          UTIL_IDEAL_FEED_DENSE_S16_FEED_DUTY: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_feed_duty }}
+          UTIL_IDEAL_FEED_DENSE_S4_REQ_DUTY_A: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_req_duty_a }}
+          UTIL_IDEAL_FEED_DENSE_S4_REQ_DUTY_B: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_req_duty_b }}
+          UTIL_IDEAL_FEED_DENSE_S16_REQ_DUTY_A: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_req_duty_a }}
+          UTIL_IDEAL_FEED_DENSE_S16_REQ_DUTY_B: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_req_duty_b }}
+          UTIL_IDEAL_FEED_DENSE_S4_BANK_HAZARD: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_bank_hazard }}
+          UTIL_IDEAL_FEED_DENSE_S16_BANK_HAZARD: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_bank_hazard }}
+          UTIL_IDEAL_FEED_DENSE_S4_RUN_LONGEST: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_feed_run_longest }}
+          UTIL_IDEAL_FEED_DENSE_S16_RUN_LONGEST: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_feed_run_longest }}
+          UTIL_IDEAL_FEED_DENSE_S4_RUN_AVG: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_feed_run_average }}
+          UTIL_IDEAL_FEED_DENSE_S16_RUN_AVG: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_feed_run_average }}
+          UTIL_IDEAL_FEED_DENSE_S4_BREAKS: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s4_feed_break_count }}
+          UTIL_IDEAL_FEED_DENSE_S16_BREAKS: ${{ needs.build-and-test.outputs.util_ideal_feed_dense_s16_feed_break_count }}
           GATE_COUNT: ${{ needs.openlane-prepnr.outputs.gate_count }}
           MAX_FREQUENCY_MHZ: ${{ needs.openlane-prepnr.outputs.max_frequency_mhz }}
           WORST_SLACK_NS: ${{ needs.openlane-prepnr.outputs.worst_slack_ns }}
@@ -327,3 +523,18 @@ jobs:
           echo "| Ideal array utilization | ${UTIL_IDEAL_S4_ARRAY:-n/a} | ${UTIL_IDEAL_S16_ARRAY:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Ideal stream utilization | ${UTIL_IDEAL_S4_STREAM:-n/a} | ${UTIL_IDEAL_S16_STREAM:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Random-latency stream utilization | ${UTIL_RANDLAT_S4_STREAM:-n/a} | ${UTIL_RANDLAT_S16_STREAM:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Near-100% Utilization Gates (ideal_feed_dense)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | S=4 | S=16 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| feed_duty | ${UTIL_IDEAL_FEED_DENSE_S4_FEED_DUTY:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_FEED_DUTY:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| req_duty_a | ${UTIL_IDEAL_FEED_DENSE_S4_REQ_DUTY_A:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_REQ_DUTY_A:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| req_duty_b | ${UTIL_IDEAL_FEED_DENSE_S4_REQ_DUTY_B:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_REQ_DUTY_B:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| stall_bank_hazard_cycles | ${UTIL_IDEAL_FEED_DENSE_S4_BANK_HAZARD:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_BANK_HAZARD:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### FEED Run-Length Snapshot (ideal_feed_dense)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | S=4 | S=16 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| feed_run_longest_cycles | ${UTIL_IDEAL_FEED_DENSE_S4_RUN_LONGEST:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_RUN_LONGEST:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| feed_run_average_cycles | ${UTIL_IDEAL_FEED_DENSE_S4_RUN_AVG:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_RUN_AVG:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| feed_break_count | ${UTIL_IDEAL_FEED_DENSE_S4_BREAKS:-n/a} | ${UTIL_IDEAL_FEED_DENSE_S16_BREAKS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
