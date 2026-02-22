@@ -24,7 +24,7 @@
 - [x] **Stage 16** — Multi-step continuous A/B prefetch
 - [x] **Stage 17** — Deep staged-tile buffering and injector decoupling
 - [x] **Stage 18** — Drain decoupling and hazard narrowing
-- [ ] **Stage 19** — FEED run-length optimization
+- [x] **Stage 19** — FEED run-length optimization
 - [ ] **Stage 20** — Near-100% PE utilization CI closure
 
 ---

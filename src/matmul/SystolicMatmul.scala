@@ -717,6 +717,8 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
   when(injectSlotQ.io.pop.valid) {
     injectStageReady := stagedAValid(injectSlotQ.io.pop.payload) && stagedBValid(injectSlotQ.io.pop.payload)
   }
+  val stagedNextAConsPtr = stagePtrInc(stagedAConsPtr)
+  val stagedNextBConsPtr = stagePtrInc(stagedBConsPtr)
 
   switch(injectState) {
     is(InjectState.IDLE) {
@@ -774,6 +776,39 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
         assert(stagedBValid(injectStageSlotB), "staged B consume without valid tile")
         assert(injectStageSlotA === injectStageSlotB, "A/B staged consume slot mismatch")
 
+        val postBank0ComputeBusy = Bool()
+        val postBank1ComputeBusy = Bool()
+        postBank0ComputeBusy := Mux(injectCtx.bankSel, bank0ComputeBusy, False)
+        postBank1ComputeBusy := Mux(injectCtx.bankSel, False, bank1ComputeBusy)
+
+        val postBank0DrainBusy = bank0DrainBusy || (!injectCtx.bankSel && injectCtx.drainTrigger)
+        val postBank1DrainBusy = bank1DrainBusy || (injectCtx.bankSel && injectCtx.drainTrigger)
+        val postBank0RowBusyNonZero = (bank0RowBusy =/= 0) || (!injectCtx.bankSel && injectCtx.drainTrigger)
+        val postBank1RowBusyNonZero = (bank1RowBusy =/= 0) || (injectCtx.bankSel && injectCtx.drainTrigger)
+
+        val nextSelectedConflict = Bool()
+        nextSelectedConflict := False
+        when(injectQ.io.pop.valid) {
+          when(injectQ.io.pop.payload.bankSel) {
+            nextSelectedConflict := postBank1ComputeBusy || postBank1DrainBusy || postBank1RowBusyNonZero
+          } otherwise {
+            nextSelectedConflict := postBank0ComputeBusy || postBank0DrainBusy || postBank0RowBusyNonZero
+          }
+        }
+        val nextGlobalDrainHazard = postBank0DrainBusy || postBank1DrainBusy
+        val nextBankHazard = nextGlobalDrainHazard || nextSelectedConflict
+        val nextDrainBookkeepingHazard =
+          injectQ.io.pop.valid &&
+            injectQ.io.pop.payload.drainTrigger &&
+            (drainEnqueuePendingValid || injectCtx.drainTrigger)
+        val canChainNextStep =
+          injectQ.io.pop.valid &&
+            injectSlotQ.io.pop.valid &&
+            injectSeqQ.io.pop.valid &&
+            injectStageReady &&
+            !nextBankHazard &&
+            !nextDrainBookkeepingHazard
+
         stagedAValid(injectStageSlotA) := False
         stagedBValid(injectStageSlotB) := False
         stagedConsumeFire := True
@@ -796,7 +831,31 @@ case class SystolicMatmul(cfg: SystolicMatmulConfig = SystolicMatmulConfig()) ex
           drainEnqueuePendingValid := True
           drainEnqueuePendingCtx := injectCtx
         }
-        injectState := InjectState.IDLE
+
+        when(canChainNextStep) {
+          assert(injectSeqQ.io.pop.payload === stagedConsumeSeq, "staged step order violation at chained inject")
+          assert(injectSlotQ.io.pop.payload === stagedNextAConsPtr, "staged A consume pointer order violation at chained inject")
+          assert(injectSlotQ.io.pop.payload === stagedNextBConsPtr, "staged B consume pointer order violation at chained inject")
+
+          injectQ.io.pop.ready := True
+          injectSlotQ.io.pop.ready := True
+          injectSeqQ.io.pop.ready := True
+          injectCtx := injectQ.io.pop.payload
+          injectStageSlotA := injectSlotQ.io.pop.payload
+          injectStageSlotB := injectSlotQ.io.pop.payload
+          stagedConsumeSeq := stagedConsumeSeq + 1
+          coreBankSel := injectQ.io.pop.payload.bankSel
+          when(injectQ.io.pop.payload.bankSel) {
+            bank1ComputeBusy := True
+          } otherwise {
+            bank0ComputeBusy := True
+          }
+          feedCnt := 0
+          traceFeedStart := True
+          injectState := InjectState.FEED
+        } otherwise {
+          injectState := InjectState.IDLE
+        }
       } otherwise {
         feedCnt := feedCnt + 1
       }

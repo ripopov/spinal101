@@ -66,7 +66,16 @@ class UtilizationSpec extends AnyFunSuite {
       bucketPrefetchSetupCycles: BigInt,
       bucketBankHazardWaitCycles: BigInt,
       bucketDrainEnqueueBookkeepingCycles: BigInt,
-      bucketOutputBackpressureCycles: BigInt
+      bucketOutputBackpressureCycles: BigInt,
+      feedRunCount: BigInt,
+      feedRunLongestCycles: BigInt,
+      feedRunAverageCycles: Double,
+      feedBreakCount: BigInt,
+      feedBreakPrefetchSetup: BigInt,
+      feedBreakBankHazardWait: BigInt,
+      feedBreakDrainEnqueueBookkeeping: BigInt,
+      feedBreakOutputBackpressure: BigInt,
+      feedBreakOther: BigInt
   ) {
     def nonFeedCycles: BigInt = measuredStallSampleCycles
 
@@ -76,14 +85,27 @@ class UtilizationSpec extends AnyFunSuite {
         bucketDrainEnqueueBookkeepingCycles +
         bucketOutputBackpressureCycles
 
+    def feedDutyWindowCycles: BigInt =
+      measuredFeedCycles +
+        bucketBankHazardWaitCycles +
+        bucketDrainEnqueueBookkeepingCycles +
+        bucketOutputBackpressureCycles
+
     def feedDuty: Double =
-      if (measuredWindowCycles == 0) 0.0 else measuredFeedCycles.toDouble / measuredWindowCycles.toDouble
+      if (feedDutyWindowCycles == 0) 0.0 else measuredFeedCycles.toDouble / feedDutyWindowCycles.toDouble
 
     def reqDutyA: Double =
       if (measuredWindowCycles == 0) 0.0 else reqFireACycles.toDouble / measuredWindowCycles.toDouble
 
     def reqDutyB: Double =
       if (measuredWindowCycles == 0) 0.0 else reqFireBCycles.toDouble / measuredWindowCycles.toDouble
+
+    def feedBreaksClassified: BigInt =
+      feedBreakPrefetchSetup +
+        feedBreakBankHazardWait +
+        feedBreakDrainEnqueueBookkeeping +
+        feedBreakOutputBackpressure +
+        feedBreakOther
   }
 
   private final case class UtilizationMetrics(
@@ -160,6 +182,7 @@ class UtilizationSpec extends AnyFunSuite {
       s"measured_window_cycles=${metrics.window.measuredWindowCycles}",
       s"measured_feed_cycles=${metrics.window.measuredFeedCycles}",
       s"measured_stall_sample_cycles=${metrics.window.measuredStallSampleCycles}",
+      s"feed_duty_window_cycles=${metrics.window.feedDutyWindowCycles}",
       f"feed_duty=${metrics.feedDuty}%.6f",
       s"req_fire_a_cycles=${metrics.window.reqFireACycles}",
       s"req_fire_b_cycles=${metrics.window.reqFireBCycles}",
@@ -169,6 +192,16 @@ class UtilizationSpec extends AnyFunSuite {
       s"bucket_bank_hazard_wait_cycles=${metrics.window.bucketBankHazardWaitCycles}",
       s"bucket_drain_enqueue_bookkeeping_cycles=${metrics.window.bucketDrainEnqueueBookkeepingCycles}",
       s"bucket_output_backpressure_cycles=${metrics.window.bucketOutputBackpressureCycles}",
+      s"feed_run_count=${metrics.window.feedRunCount}",
+      s"feed_run_longest_cycles=${metrics.window.feedRunLongestCycles}",
+      f"feed_run_average_cycles=${metrics.window.feedRunAverageCycles}%.6f",
+      s"feed_break_count=${metrics.window.feedBreakCount}",
+      s"feed_break_prefetch_setup=${metrics.window.feedBreakPrefetchSetup}",
+      s"feed_break_bank_hazard_wait=${metrics.window.feedBreakBankHazardWait}",
+      s"feed_break_drain_enqueue_bookkeeping=${metrics.window.feedBreakDrainEnqueueBookkeeping}",
+      s"feed_break_output_backpressure=${metrics.window.feedBreakOutputBackpressure}",
+      s"feed_break_other=${metrics.window.feedBreakOther}",
+      s"feed_break_classified_count=${metrics.window.feedBreaksClassified}",
       s"bucket_non_feed_cycles=${metrics.window.nonFeedCycles}",
       s"bucket_non_feed_sum_cycles=${metrics.window.bucketedNonFeedCycles}",
       s"stall_no_step_cycles=${metrics.steadyStalls.stallNoStepCycles}",
@@ -240,6 +273,48 @@ class UtilizationSpec extends AnyFunSuite {
       primK = s
     )
 
+  private def mkScaledCmd(
+      cmdId: Int,
+      baseAddr: BigInt,
+      s: Int,
+      mMul: Int,
+      nMul: Int,
+      kMul: Int,
+      primMMul: Int,
+      primNMul: Int,
+      primKMul: Int
+  ): CommandDesc = {
+    val m = mMul * s
+    val n = nMul * s
+    val k = kMul * s
+    val primM = primMMul * s
+    val primN = primNMul * s
+    val primK = primKMul * s
+    CommandDesc(
+      cmdId = cmdId,
+      aBase = baseAddr,
+      bBase = baseAddr + BigInt(0x100000),
+      dBase = baseAddr + BigInt(0x200000),
+      m = m,
+      n = n,
+      k = k,
+      lda = k,
+      ldb = n,
+      ldd = n,
+      primM = primM,
+      primN = primN,
+      primK = primK
+    )
+  }
+
+  private def mkMixedPrimitiveBatch(startCmdId: Int, baseAddr: BigInt, s: Int): Seq[CommandDesc] =
+    Seq(
+      mkScaledCmd(startCmdId + 0, baseAddr + BigInt(0x000000), s, mMul = 4, nMul = 4, kMul = 16, primMMul = 4, primNMul = 4, primKMul = 16),
+      mkScaledCmd(startCmdId + 1, baseAddr + BigInt(0x080000), s, mMul = 8, nMul = 4, kMul = 16, primMMul = 4, primNMul = 2, primKMul = 16),
+      mkScaledCmd(startCmdId + 2, baseAddr + BigInt(0x100000), s, mMul = 4, nMul = 8, kMul = 16, primMMul = 2, primNMul = 4, primKMul = 16),
+      mkScaledCmd(startCmdId + 3, baseAddr + BigInt(0x180000), s, mMul = 8, nMul = 8, kMul = 16, primMMul = 4, primNMul = 4, primKMul = 16)
+    )
+
   private def buildWindowMetrics(scenario: String, samples: Seq[CycleSample], startCycle: Long, endCycle: Long): WindowMetrics = {
     require(endCycle >= startCycle, s"$scenario invalid window start=$startCycle end=$endCycle")
 
@@ -257,6 +332,51 @@ class UtilizationSpec extends AnyFunSuite {
     val bucketDrainEnqueueBookkeepingCycles = BigInt(inWindow.count(s => s.stallSample && s.bucketDrainEnqueueBookkeeping))
     val bucketOutputBackpressureCycles = BigInt(inWindow.count(s => s.stallSample && s.bucketOutputBackpressure))
 
+    val feedRunLengths = mutable.ArrayBuffer.empty[Int]
+    var feedRun = 0
+    inWindow.foreach { s =>
+      if (s.feed) {
+        feedRun += 1
+      } else if (feedRun > 0) {
+        feedRunLengths += feedRun
+        feedRun = 0
+      }
+    }
+    if (feedRun > 0) feedRunLengths += feedRun
+
+    val feedRunCount = BigInt(feedRunLengths.size)
+    val feedRunLongestCycles = BigInt(if (feedRunLengths.nonEmpty) feedRunLengths.max else 0)
+    val feedRunAverageCycles = if (feedRunLengths.nonEmpty) feedRunLengths.sum.toDouble / feedRunLengths.size.toDouble else 0.0
+
+    val hasFutureFeed = Array.fill(inWindow.size)(false)
+    var seenFeedAhead = false
+    var idx = inWindow.size - 1
+    while (idx >= 0) {
+      hasFutureFeed(idx) = seenFeedAhead
+      if (inWindow(idx).feed) seenFeedAhead = true
+      idx -= 1
+    }
+
+    var feedBreakCount = BigInt(0)
+    var feedBreakPrefetchSetup = BigInt(0)
+    var feedBreakBankHazardWait = BigInt(0)
+    var feedBreakDrainEnqueueBookkeeping = BigInt(0)
+    var feedBreakOutputBackpressure = BigInt(0)
+    var feedBreakOther = BigInt(0)
+    var prevFeed = false
+    inWindow.zipWithIndex.foreach { case (sample, i) =>
+      val isBreakStart = !sample.feed && prevFeed && hasFutureFeed(i)
+      if (isBreakStart) {
+        feedBreakCount += 1
+        if (sample.bucketOutputBackpressure) feedBreakOutputBackpressure += 1
+        else if (sample.bucketDrainEnqueueBookkeeping) feedBreakDrainEnqueueBookkeeping += 1
+        else if (sample.bucketBankHazardWait) feedBreakBankHazardWait += 1
+        else if (sample.bucketPrefetchSetup) feedBreakPrefetchSetup += 1
+        else feedBreakOther += 1
+      }
+      prevFeed = sample.feed
+    }
+
     WindowMetrics(
       startCycle = startCycle,
       endCycle = endCycle,
@@ -268,19 +388,28 @@ class UtilizationSpec extends AnyFunSuite {
       bucketPrefetchSetupCycles = bucketPrefetchSetupCycles,
       bucketBankHazardWaitCycles = bucketBankHazardWaitCycles,
       bucketDrainEnqueueBookkeepingCycles = bucketDrainEnqueueBookkeepingCycles,
-      bucketOutputBackpressureCycles = bucketOutputBackpressureCycles
+      bucketOutputBackpressureCycles = bucketOutputBackpressureCycles,
+      feedRunCount = feedRunCount,
+      feedRunLongestCycles = feedRunLongestCycles,
+      feedRunAverageCycles = feedRunAverageCycles,
+      feedBreakCount = feedBreakCount,
+      feedBreakPrefetchSetup = feedBreakPrefetchSetup,
+      feedBreakBankHazardWait = feedBreakBankHazardWait,
+      feedBreakDrainEnqueueBookkeeping = feedBreakDrainEnqueueBookkeeping,
+      feedBreakOutputBackpressure = feedBreakOutputBackpressure,
+      feedBreakOther = feedBreakOther
     )
   }
 
-  private def runScenario(
+  private def runScenarioWithCommands(
       compiled: SimCompiled[SystolicMatmul],
       simName: String,
       scenario: String,
       cfg: HarnessConfig,
-      cmdCount: Int,
+      cmds: Seq[CommandDesc],
       seedBase: Int
   ): UtilizationMetrics = {
-    require(cmdCount >= 1, "cmdCount must be >= 1")
+    require(cmds.nonEmpty, "cmd list must be non-empty")
 
     var captured: Option[UtilizationMetrics] = None
 
@@ -291,13 +420,6 @@ class UtilizationSpec extends AnyFunSuite {
       dut.clockDomain.waitSampling(2)
 
       val s = cfg.dutCfg.s
-      val cmds = (0 until cmdCount).map { i =>
-        mkThroughputCmd(
-          cmdId = 7000 + i,
-          baseAddr = BigInt(0x1000000L) + BigInt(i) * 0x800000,
-          s = s
-        )
-      }
 
       val queued = cmds.zipWithIndex.map { case (cmd, i) =>
         val a = mkRows(cmd.m, cmd.k, cmd.lda, seedBase + i * 2)
@@ -307,7 +429,8 @@ class UtilizationSpec extends AnyFunSuite {
 
       val samples = mutable.ArrayBuffer.empty[CycleSample]
       var firstFeedStartCycle: Option[Long] = None
-      var lastDrainDoneCycle: Option[Long] = None
+      var firstFeedCycle: Option[Long] = None
+      var lastFeedCycle: Option[Long] = None
       @volatile var monitorStop = false
       var simCycle = 0L
 
@@ -326,6 +449,11 @@ class UtilizationSpec extends AnyFunSuite {
             val stallSample = dut.utilStallSample.toBoolean
             val aReqFire = dut.io.a_rd_req_valid.toBoolean && dut.io.a_rd_req_ready.toBoolean
             val bReqFire = dut.io.b_rd_req_valid.toBoolean && dut.io.b_rd_req_ready.toBoolean
+
+            if (feed) {
+              if (firstFeedCycle.isEmpty) firstFeedCycle = Some(cycle)
+              lastFeedCycle = Some(cycle)
+            }
 
             val bucketPrefetchSetup = dut.utilStallCausePrefetchSetup.toBoolean
             val bucketBankHazardWait = dut.utilStallCauseBankHazardWait.toBoolean
@@ -356,10 +484,6 @@ class UtilizationSpec extends AnyFunSuite {
               bucketOutputBackpressure = bucketOutputBackpressure
             )
           }
-
-          if (dut.traceDrainDone.toBoolean && firstFeedStartCycle.isDefined) {
-            lastDrainDoneCycle = Some(cycle)
-          }
         }
       }
 
@@ -376,8 +500,8 @@ class UtilizationSpec extends AnyFunSuite {
       val steady = endCounters - startCounters
       val expectedSteady = cmds.map(c => expectedFullCycles(c, s)).foldLeft(BigInt(0))(_ + _)
 
-      val startCycle = firstFeedStartCycle.getOrElse(fail(s"$scenario missing first traceFeedStart"))
-      val endCycle = lastDrainDoneCycle.getOrElse(fail(s"$scenario missing last traceDrainDone"))
+      val startCycle = firstFeedCycle.getOrElse(fail(s"$scenario missing first FEED cycle"))
+      val endCycle = lastFeedCycle.getOrElse(fail(s"$scenario missing last FEED cycle"))
       val window = buildWindowMetrics(scenario, samples.toSeq, startCycle, endCycle)
 
       val fireCycles = tb.out.fireCycles.toSeq
@@ -388,7 +512,7 @@ class UtilizationSpec extends AnyFunSuite {
         scenario = scenario,
         tag = s"s$s",
         s = s,
-        cmdCount = cmdCount,
+        cmdCount = cmds.length,
         expectedSteadyFullCycles = expectedSteady,
         observedSteadyFullCycles = steady.injectFullCycles,
         steadyWindowCycles = steady.injectWindowCycles,
@@ -409,6 +533,26 @@ class UtilizationSpec extends AnyFunSuite {
     captured.getOrElse(fail(s"$scenario did not capture metrics"))
   }
 
+  private def runScenario(
+      compiled: SimCompiled[SystolicMatmul],
+      simName: String,
+      scenario: String,
+      cfg: HarnessConfig,
+      cmdCount: Int,
+      seedBase: Int
+  ): UtilizationMetrics = {
+    require(cmdCount >= 1, "cmdCount must be >= 1")
+    val s = cfg.dutCfg.s
+    val cmds = (0 until cmdCount).map { i =>
+      mkThroughputCmd(
+        cmdId = 7000 + i,
+        baseAddr = BigInt(0x1000000L) + BigInt(i) * 0x800000,
+        s = s
+      )
+    }
+    runScenarioWithCommands(compiled, simName, scenario, cfg, cmds, seedBase)
+  }
+
   private def assertCommonStallBudgets(metrics: UtilizationMetrics, label: String): Unit = {
     assert(metrics.steadyStalls.stallNoStepCycles == 0, s"$label no_step must be 0")
     assert(metrics.steadyStalls.stallDrainBlockedCycles == 0, s"$label drain_blocked must be 0")
@@ -420,6 +564,21 @@ class UtilizationSpec extends AnyFunSuite {
     assert(metrics.window.endCycle >= metrics.window.startCycle, s"$label invalid measured window range")
     assert(metrics.window.bucketedNonFeedCycles == metrics.window.nonFeedCycles,
       s"$label non-FEED cycles not fully attributed: nonFeed=${metrics.window.nonFeedCycles} bucketed=${metrics.window.bucketedNonFeedCycles}")
+    assert(metrics.window.feedDutyWindowCycles > 0, s"$label feed_duty window must be > 0")
+    assert(metrics.window.feedBreaksClassified == metrics.window.feedBreakCount,
+      s"$label feed break causes not fully attributed: breaks=${metrics.window.feedBreakCount} classified=${metrics.window.feedBreaksClassified}")
+    assert(metrics.window.feedRunCount >= 0, s"$label feed run count must be >= 0")
+    assert(metrics.window.feedRunLongestCycles >= 0, s"$label feed longest run must be >= 0")
+    if (metrics.window.feedRunCount == 0) {
+      assert(metrics.window.measuredFeedCycles == 0, s"$label zero run-count with non-zero feed cycles")
+      assert(metrics.window.feedBreakCount == 0, s"$label zero run-count must imply zero feed breaks")
+    } else {
+      val reconstructedFeedAvg = metrics.window.measuredFeedCycles.toDouble / metrics.window.feedRunCount.toDouble
+      val feedAvgDelta = math.abs(reconstructedFeedAvg - metrics.window.feedRunAverageCycles)
+      assert(feedAvgDelta <= 1e-9, f"$label feed run average mismatch: expected=$reconstructedFeedAvg%.9f got=${metrics.window.feedRunAverageCycles}%.9f")
+      assert(metrics.window.feedRunLongestCycles <= metrics.window.measuredFeedCycles, s"$label longest run exceeds measured feed cycles")
+      assert(metrics.window.feedBreakCount <= (metrics.window.feedRunCount - 1), s"$label feed break count exceeds max for run-count")
+    }
     assert(metrics.feedDuty >= 0.0 && metrics.feedDuty <= 1.0, s"$label feed_duty out of range")
     assert(metrics.reqDutyA >= 0.0 && metrics.reqDutyA <= 1.0, s"$label req_duty_a out of range")
     assert(metrics.reqDutyB >= 0.0 && metrics.reqDutyB <= 1.0, s"$label req_duty_b out of range")
@@ -513,7 +672,118 @@ class UtilizationSpec extends AnyFunSuite {
     val idealOut = writeMetrics(ideal, s"ideal_${tag}")
     info(
       f"[util-gate $tag ideal] array=${ideal.steadyArrayUtilization}%.6f stream=${ideal.streamUtilization}%.6f " +
-        f"feed_duty=${ideal.feedDuty}%.6f reqA=${ideal.reqDutyA}%.6f reqB=${ideal.reqDutyB}%.6f file=${idealOut.toAbsolutePath}"
+        f"feed_duty=${ideal.feedDuty}%.6f reqA=${ideal.reqDutyA}%.6f reqB=${ideal.reqDutyB}%.6f " +
+        f"feedRunLongest=${ideal.window.feedRunLongestCycles} feedRunAvg=${ideal.window.feedRunAverageCycles}%.3f " +
+        s"feedBreaks=${ideal.window.feedBreakCount} file=${idealOut.toAbsolutePath}"
+    )
+
+    val idealFeedCmd = mkScaledCmd(
+      cmdId = 7900 + s,
+      baseAddr = BigInt(0x2400000L),
+      s = s,
+      mMul = 4,
+      nMul = 4,
+      kMul = 16,
+      primMMul = 4,
+      primNMul = 4,
+      primKMul = 16
+    )
+    val idealFeed = runScenarioWithCommands(
+      compiled = compiled,
+      simName = s"util_gate_${tag}_ideal_feed_dense",
+      scenario = "ideal_feed_dense",
+      cfg = idealCfg,
+      cmds = Seq(idealFeedCmd),
+      seedBase = 12500 + s
+    )
+    assert(idealFeed.observedSteadyFullCycles == idealFeed.expectedSteadyFullCycles, s"ideal_feed_dense $tag steady full-cycle mismatch")
+    assert(idealFeed.steadyArrayUtilization == 1.0, s"ideal_feed_dense $tag array_util must be exactly 1.0")
+    assert(idealFeed.streamUtilization >= 0.98, f"ideal_feed_dense $tag stream_util=${idealFeed.streamUtilization}%.6f < 0.98")
+    assertCommonStallBudgets(idealFeed, s"ideal_feed_dense $tag")
+    assertMeasuredAttribution(idealFeed, s"ideal_feed_dense $tag")
+    assert(idealFeed.feedDuty >= 0.95, f"ideal_feed_dense $tag feed_duty=${idealFeed.feedDuty}%.6f < 0.95")
+    assert(idealFeed.window.feedRunLongestCycles >= BigInt(5 * s),
+      s"ideal_feed_dense $tag longest FEED run too short: got=${idealFeed.window.feedRunLongestCycles} floor=${5 * s}")
+    assert(idealFeed.window.feedRunAverageCycles >= (1.2 * s),
+      f"ideal_feed_dense $tag average FEED run too short: got=${idealFeed.window.feedRunAverageCycles}%.3f floor=${1.2 * s}%.3f")
+    val idealFeedOut = writeMetrics(idealFeed, s"ideal_feed_dense_${tag}")
+    info(
+      f"[util-gate $tag ideal_feed_dense] array=${idealFeed.steadyArrayUtilization}%.6f stream=${idealFeed.streamUtilization}%.6f " +
+        f"feed_duty=${idealFeed.feedDuty}%.6f feedRunLongest=${idealFeed.window.feedRunLongestCycles} " +
+        f"feedRunAvg=${idealFeed.window.feedRunAverageCycles}%.3f feedBreaks=${idealFeed.window.feedBreakCount} " +
+        s"file=${idealFeedOut.toAbsolutePath}"
+    )
+
+    val longBatchCmdCount = if (s <= 4) 6 else 3
+    val longBatchCmds = (0 until longBatchCmdCount).map { i =>
+      mkScaledCmd(
+        cmdId = 8000 + i,
+        baseAddr = BigInt(0x3000000L) + BigInt(i) * 0x800000,
+        s = s,
+        mMul = 4,
+        nMul = 4,
+        kMul = 16,
+        primMMul = 4,
+        primNMul = 4,
+        primKMul = 16
+      )
+    }
+
+    val longBatch = runScenarioWithCommands(
+      compiled = compiled,
+      simName = s"util_gate_${tag}_ideal_long_batch",
+      scenario = "ideal_long_batch",
+      cfg = idealCfg,
+      cmds = longBatchCmds,
+      seedBase = 13000 + s
+    )
+
+    assert(longBatch.observedSteadyFullCycles == longBatch.expectedSteadyFullCycles, s"ideal_long_batch $tag steady full-cycle mismatch")
+    assert(longBatch.steadyArrayUtilization == 1.0, s"ideal_long_batch $tag array_util must be exactly 1.0")
+    assertCommonStallBudgets(longBatch, s"ideal_long_batch $tag")
+    assertMeasuredAttribution(longBatch, s"ideal_long_batch $tag")
+    assert(longBatch.feedDuty >= 0.95, f"ideal_long_batch $tag feed_duty=${longBatch.feedDuty}%.6f < 0.95")
+    assert(longBatch.window.feedRunLongestCycles >= BigInt(5 * s),
+      s"ideal_long_batch $tag longest FEED run too short: got=${longBatch.window.feedRunLongestCycles} floor=${5 * s}")
+    assert(longBatch.window.feedRunAverageCycles >= (1.2 * s),
+      f"ideal_long_batch $tag average FEED run too short: got=${longBatch.window.feedRunAverageCycles}%.3f floor=${1.2 * s}%.3f")
+    assert(longBatch.window.feedBreakOutputBackpressure == 0,
+      s"ideal_long_batch $tag feed breaks due to output backpressure must be 0")
+    val longBatchOut = writeMetrics(longBatch, s"ideal_long_batch_${tag}")
+    info(
+      f"[util-gate $tag ideal_long_batch] array=${longBatch.steadyArrayUtilization}%.6f stream=${longBatch.streamUtilization}%.6f " +
+        f"feed_duty=${longBatch.feedDuty}%.6f feedRunLongest=${longBatch.window.feedRunLongestCycles} " +
+        f"feedRunAvg=${longBatch.window.feedRunAverageCycles}%.3f feedBreaks=${longBatch.window.feedBreakCount} " +
+        s"file=${longBatchOut.toAbsolutePath}"
+    )
+
+    val mixedCmds = mkMixedPrimitiveBatch(startCmdId = 9000, baseAddr = BigInt(0x3800000L), s = s)
+    val mixed = runScenarioWithCommands(
+      compiled = compiled,
+      simName = s"util_gate_${tag}_ideal_mixed_prims",
+      scenario = "ideal_mixed_prims",
+      cfg = idealCfg,
+      cmds = mixedCmds,
+      seedBase = 14000 + s
+    )
+
+    assert(mixed.observedSteadyFullCycles == mixed.expectedSteadyFullCycles, s"ideal_mixed_prims $tag steady full-cycle mismatch")
+    assert(mixed.steadyArrayUtilization == 1.0, s"ideal_mixed_prims $tag array_util must be exactly 1.0")
+    assertCommonStallBudgets(mixed, s"ideal_mixed_prims $tag")
+    assertMeasuredAttribution(mixed, s"ideal_mixed_prims $tag")
+    assert(mixed.feedDuty >= 0.95, f"ideal_mixed_prims $tag feed_duty=${mixed.feedDuty}%.6f < 0.95")
+    assert(mixed.window.feedRunLongestCycles >= BigInt(4 * s),
+      s"ideal_mixed_prims $tag longest FEED run too short: got=${mixed.window.feedRunLongestCycles} floor=${4 * s}")
+    assert(mixed.window.feedRunAverageCycles >= (1.2 * s),
+      f"ideal_mixed_prims $tag average FEED run too short: got=${mixed.window.feedRunAverageCycles}%.3f floor=${1.2 * s}%.3f")
+    assert(mixed.window.feedBreakOutputBackpressure == 0,
+      s"ideal_mixed_prims $tag feed breaks due to output backpressure must be 0")
+    val mixedOut = writeMetrics(mixed, s"ideal_mixed_prims_${tag}")
+    info(
+      f"[util-gate $tag ideal_mixed_prims] array=${mixed.steadyArrayUtilization}%.6f stream=${mixed.streamUtilization}%.6f " +
+        f"feed_duty=${mixed.feedDuty}%.6f feedRunLongest=${mixed.window.feedRunLongestCycles} " +
+        f"feedRunAvg=${mixed.window.feedRunAverageCycles}%.3f feedBreaks=${mixed.window.feedBreakCount} " +
+        s"file=${mixedOut.toAbsolutePath}"
     )
 
     val randomCfg = baseCfg.copy(
