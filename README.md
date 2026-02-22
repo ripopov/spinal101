@@ -275,3 +275,45 @@ Pre-PnR outputs are written under `build/openlane_prepnr/`:
 - `yosys.log` - synthesis log
 - `openroad.log` - STA/floorplan log
 - `opensta_checks.rpt` - timing path report
+
+## Critical Path Analysis (Current Pre-PnR Report)
+
+The current local timing snapshot in `build/openlane_prepnr/opensta_checks.rpt` reports:
+
+- `worst_slack_ns=-8023.41`
+- `critical_path_delay_ns=8032.6138`
+- `critical_startpoint=drainPacker_1/_5417263_`
+- `critical_endpoint=drainPacker_1/_5766612_`
+
+Mapping those synthesized points back to RTL/netlist shows:
+
+- `drainPacker_1/_5417263_` is register `bufIdx[2]` (DrainPacker read address bit).
+- `drainPacker_1/_5766612_` is register `dBuffer_spinal_port0[38]` (DrainPacker read-data capture bit).
+- The first arc in the path is through `drainPacker_1/_4367193_` (`mux2i`) selecting between `bufIdx` and `flushIdx` for the unified `dBuffer` read address.
+
+In RTL this corresponds to:
+
+- `src/matmul/DrainPacker.scala:73` (`bufIdx`)
+- `src/matmul/DrainPacker.scala:78` (`flushIdx`)
+- `src/matmul/DrainPacker.scala:86` - `src/matmul/DrainPacker.scala:95` (`rdAddr` mux + `dBuffer.readSync`)
+- `src/matmul/DrainPacker.scala:205` and `src/matmul/DrainPacker.scala:226` - `src/matmul/DrainPacker.scala:233` (RMW read/add flow)
+
+### Root Cause
+
+For the full-size netlist used in this report (`CL_BITS=512`, `S=16`), `dBuffer` is effectively:
+
+- depth `1024` (`8 * 8 * S`)
+- width `512`
+
+and is synthesized as standard-cell storage/mux logic (not macro SRAM). That creates a very large
+address-to-data mux tree. The reported critical path is therefore in `DrainPacker` memory-read
+selection logic, not in the PE FP32 MAC datapath.
+
+### Optimization Options
+
+1. Map `dBuffer` to SRAM macro(s) instead of flop+mux implementation.
+   - Highest-impact fix for both delay and area.
+   - Current pre-PnR script (`.github/scripts/openlane_prepnr.sh`) uses generic Yosys synth/ABC flow without memory macro mapping.
+2. Bank and narrow `dBuffer` (e.g., multiple smaller memories by lane/chunk) to reduce mux fan-in per read path.
+3. Add an explicit extra pipeline stage around RMW read/add/write in `DrainPacker` so address decode and downstream combine logic are not in one cycle.
+4. Keep CI pre-PnR default at `S=4` for trend tracking, and run `S=16` timing as a separate full-size target once memory macro mapping is enabled.
